@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>บันทึกรายจ่ายคู่รัก</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#173C36">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="รายจ่ายคู่รัก">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+Thai:wght@500;600;700&family=Noto+Sans+Thai:wght@400;500;600;700&display=swap');
+
+:root{
+  --paper:#F4EEE0;
+  --cover:#173C36;
+  --cover-dark:#0F2B27;
+  --gold:#B4922E;
+  --gold-light:#D9BE6E;
+  --ink:#2B2A24;
+  --ink-soft:#6B6A5E;
+  --p1:#B0524A;
+  --p1-soft:#F2DAD6;
+  --p2:#2F6E63;
+  --p2-soft:#DCEAE5;
+  --shared:#B4922E;
+  --shared-soft:#F1E6C8;
+  --line:#D9D0BA;
+  --danger:#A6413A;
+  --card:#FFFFFF;
+}
+*{box-sizing:border-box;}
+body{margin:0; background:var(--paper); font-family:'Noto Sans Thai',sans-serif; color:var(--ink); -webkit-font-smoothing:antialiased;}
+.app{max-width:460px; margin:0 auto; padding-bottom:50px;}
+
+.header{background:linear-gradient(160deg,var(--cover) 0%,var(--cover-dark) 100%); color:var(--paper); padding:26px 20px 22px; border-bottom:6px solid var(--gold); position:relative;}
+.header .eyebrow{font-size:12px; color:var(--gold-light); margin:0 0 4px;}
+.header h1{font-family:'Noto Serif Thai',serif; font-weight:700; font-size:21px; margin:0 0 16px;}
+.icon-btn{position:absolute; top:22px; right:18px; background:none; border:1px solid rgba(244,238,224,.35); color:rgba(244,238,224,.85); border-radius:20px; font-size:11px; padding:5px 12px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+.total-label{font-size:12px; color:rgba(244,238,224,.65); margin-bottom:2px;}
+.total-amount{font-family:'Noto Serif Thai',serif; font-weight:700; font-size:36px; color:var(--gold-light); font-variant-numeric:tabular-nums; margin-bottom:16px;}
+.breakdown-row{display:flex; gap:8px; margin-bottom:6px;}
+.breakdown-chip{flex:1; border-radius:10px; padding:10px 12px; background:rgba(244,238,224,.08);}
+.breakdown-chip .who{font-size:11px; color:rgba(244,238,224,.65); margin-bottom:2px;}
+.breakdown-chip .amt{font-size:16px; font-weight:700; font-variant-numeric:tabular-nums;}
+.breakdown-chip.p1 .amt{color:#E8B0A6;}
+.breakdown-chip.p2 .amt{color:#9ED4C6;}
+.breakdown-chip.shared .amt{color:var(--gold-light);}
+.add-btn-main{width:100%; padding:13px; border:none; border-radius:9px; background:var(--gold-light); color:var(--cover-dark); font-weight:700; font-size:14.5px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif; margin-top:14px;}
+
+.expense-form{background:#fff; margin:16px 18px 0; border-radius:12px; padding:16px; border:1px solid var(--line);}
+.expense-form h3{font-size:14px; margin:0 0 12px; color:var(--ink-soft); font-weight:600;}
+.who-toggle3{display:flex; gap:6px; margin-bottom:10px;}
+.who-btn{flex:1; padding:9px 4px; border-radius:8px; border:1.5px solid var(--line); background:#fff; font-size:12.5px; font-weight:600; cursor:pointer; font-family:'Noto Sans Thai',sans-serif; color:var(--ink-soft);}
+.who-btn.active.p1{border-color:var(--p1); background:var(--p1-soft); color:var(--p1);}
+.who-btn.active.p2{border-color:var(--p2); background:var(--p2-soft); color:var(--p2);}
+.who-btn.active.shared{border-color:var(--shared); background:var(--shared-soft); color:#8A6E1F;}
+select, .expense-form input{width:100%; padding:10px 11px; border:1.5px solid var(--line); border-radius:7px; font-size:14px; margin-bottom:8px; font-family:'Noto Sans Thai',sans-serif; background:#fff; color:var(--ink);}
+select:focus, .expense-form input:focus{outline:none; border-color:var(--cover);}
+.cat-row{display:flex; gap:8px;}
+.cat-row select{flex:1;}
+.manage-cat-btn{flex:none; padding:0 12px; border-radius:7px; border:1px solid var(--line); background:#fff; color:var(--ink-soft); font-size:12px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+.save-btn{width:100%; padding:11px; border:none; border-radius:7px; background:var(--gold); color:#fff; font-weight:700; font-size:13.5px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif; margin-top:4px;}
+
+.section-title{font-family:'Noto Serif Thai',serif; font-size:15px; color:var(--ink-soft); margin:20px 18px 10px; display:flex; justify-content:space-between; align-items:center;}
+
+.cat-bars{margin:0 18px;}
+.cat-bar-row{background:var(--card); border-radius:10px; padding:12px 14px; margin-bottom:8px; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+.cat-bar-row .top{display:flex; justify-content:space-between; font-size:13px; margin-bottom:6px;}
+.cat-bar-row .top .name{font-weight:600;}
+.cat-bar-row .top .amt{font-variant-numeric:tabular-nums; color:var(--ink-soft);}
+.cat-bar-track{height:8px; border-radius:5px; background:#EFEAE0; overflow:hidden;}
+.cat-bar-fill{height:100%; border-radius:5px;}
+
+.ledger{margin:20px 18px 0;}
+.entry{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line);}
+.entry:last-child{border-bottom:none;}
+.entry .stripe{width:4px; align-self:stretch; border-radius:3px; flex:none;}
+.entry .stripe.p1{background:var(--p1);}
+.entry .stripe.p2{background:var(--p2);}
+.entry .stripe.shared{background:var(--shared);}
+.entry .info{flex:1; min-width:0;}
+.entry .cat{font-size:13px; font-weight:600;}
+.entry .meta{font-size:11px; color:var(--ink-soft); margin-top:2px;}
+.entry .note{font-size:12px; color:var(--ink-soft); margin-top:2px; font-style:italic; overflow-wrap:break-word;}
+.entry .amt{font-size:14.5px; font-weight:700; font-variant-numeric:tabular-nums; flex:none;}
+.entry .del{background:none; border:none; color:var(--line); font-size:16px; cursor:pointer; padding:4px 2px; flex:none;}
+.entry .del:hover{color:var(--danger);}
+.empty-state{text-align:center; padding:26px 10px; color:var(--ink-soft); font-size:13px;}
+
+.line-notice{margin:20px 18px 0; background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 16px;}
+.line-notice p{font-size:12.5px; color:var(--ink-soft); margin:0 0 10px; line-height:1.6;}
+.line-notice .btn-row{display:flex; gap:8px;}
+.line-notice button{flex:1; background:none; border:1px solid var(--cover); color:var(--cover); border-radius:16px; font-size:12px; padding:8px 10px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+
+.footer-links{display:flex; justify-content:center; gap:16px; margin-top:22px;}
+.footer-links button{background:none; border:none; color:var(--ink-soft); font-size:12px; text-decoration:underline; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+
+.loading, .err{text-align:center; padding:60px 24px; color:var(--ink-soft); font-size:13.5px; line-height:1.7;}
+.err{color:var(--danger);}
+
+.field{margin-bottom:14px;}
+.field label{display:block; font-size:12px; font-weight:600; color:var(--ink-soft); margin-bottom:5px;}
+.field input{width:100%; padding:11px 12px; border:1.5px solid var(--line); border-radius:8px; font-size:14px; font-family:'Noto Sans Thai',sans-serif; background:#fff; color:var(--ink);}
+.field-row{display:flex; gap:10px;}
+.field-row .field{flex:1;}
+.setup{padding:26px 22px;}
+.setup h2{font-family:'Noto Serif Thai',serif; font-size:19px; margin:0 0 6px;}
+.setup p.sub{color:var(--ink-soft); font-size:13px; margin:0 0 18px; line-height:1.6;}
+.primary-btn{width:100%; padding:13px; border:none; border-radius:8px; background:var(--cover); color:var(--paper); font-size:15px; font-weight:600; font-family:'Noto Sans Thai',sans-serif; cursor:pointer; margin-top:4px;}
+.text-btn{background:none; border:none; color:var(--ink-soft); font-size:13px; text-decoration:underline; cursor:pointer; padding:10px 0 0; width:100%; font-family:'Noto Sans Thai',sans-serif;}
+
+.modal-back{position:fixed; inset:0; background:rgba(23,60,54,.5); display:flex; align-items:flex-end; justify-content:center; z-index:10;}
+.modal{background:var(--paper); width:100%; max-width:460px; border-radius:16px 16px 0 0; padding:22px; max-height:85vh; overflow-y:auto;}
+.modal h2{font-family:'Noto Serif Thai',serif; font-size:18px; margin:0 0 14px;}
+.cat-list-item{display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--line);}
+.cat-list-item .del-cat-x{background:none; border:none; color:var(--line); font-size:15px; cursor:pointer;}
+.cat-list-item .del-cat-x:hover{color:var(--danger);}
+.add-cat-row{display:flex; gap:8px; margin-top:12px;}
+.add-cat-row input{flex:1;}
+.add-cat-row button{flex:none; padding:0 16px; border:none; border-radius:7px; background:var(--gold); color:#fff; font-weight:700; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+</style>
+</head>
+<body>
+<div class="app" id="app"><div class="loading">กำลังเปิดสมุดรายจ่าย...</div></div>
+
+<script>
+const CONFIG_KEY = 'expense-tracker-config';
+let config = null;
+let data = null;
+let showForm = false;
+let formWho = 1; // 1, 2, or 'shared'
+
+const app = document.getElementById('app');
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+function baht(n){ return Number(n||0).toLocaleString('th-TH'); }
+function todayISO(){ return new Date().toISOString(); }
+function thMonth(){ return new Date().toLocaleDateString('th-TH', {month:'long', year:'numeric'}); }
+function thDate(iso){ return new Date(iso).toLocaleDateString('th-TH', {day:'numeric', month:'short'}); }
+function cssId(s){ return s.replace(/[^a-zA-Z0-9\u0E00-\u0E7F]/g,'_'); }
+const PALETTE = ['#2F6E63','#B0524A','#8A6BAE','#B4922E','#6E8B3D','#A64F7E','#3B6EA5'];
+function catColor(i){ return PALETTE[i % PALETTE.length]; }
+
+async function loadConfig(){
+  try{
+    const raw = localStorage.getItem(CONFIG_KEY);
+    config = raw ? JSON.parse(raw) : null;
+  }catch(e){ config = null; }
+  if(config && config.webAppUrl){ await loadData(); } else { renderSetupUrl(); }
+}
+async function saveConfig(){
+  try{ localStorage.setItem(CONFIG_KEY, JSON.stringify(config)); }catch(e){}
+}
+
+function jsonp(url, params){
+  return new Promise((resolve, reject) => {
+    const cbName = 'cb_' + Date.now() + '_' + Math.floor(Math.random()*100000);
+    const qs = new URLSearchParams(Object.assign({}, params, {callback: cbName})).toString();
+    const script = document.createElement('script');
+    const timeout = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, 15000);
+    function cleanup(){
+      clearTimeout(timeout);
+      delete window[cbName];
+      if(script.parentNode) script.parentNode.removeChild(script);
+    }
+    window[cbName] = (d) => { cleanup(); resolve(d); };
+    script.src = url + (url.indexOf('?')>-1 ? '&' : '?') + qs;
+    script.onerror = () => { cleanup(); reject(new Error('jsonp load failed')); };
+    document.body.appendChild(script);
+  });
+}
+async function api(action, payload){
+  return jsonp(config.webAppUrl, Object.assign({action, key: config.adminKey || ''}, payload||{}));
+}
+
+async function loadData(){
+  app.innerHTML = '<div class="loading">กำลังโหลดข้อมูล...</div>';
+  try{
+    data = await api('data');
+    if(data && data.error){ throw new Error(data.error); }
+    render();
+  }catch(e){
+    app.innerHTML = `
+      <div class="err">เชื่อมต่อไม่สำเร็จ<br>${esc(e.message || '')}<br><br>ตรวจสอบ Web app URL และรหัสผู้ดูแลอีกครั้ง</div>
+      <div style="padding:0 22px;"><button class="text-btn" id="btn-recheck-url">แก้ไข Web app URL</button></div>
+    `;
+    document.getElementById('btn-recheck-url').onclick = () => renderSetupUrl(true);
+  }
+}
+
+function renderSetupUrl(isEdit){
+  app.innerHTML = `
+    <div class="header"><p class="eyebrow">ตั้งค่าเริ่มต้น</p><h1>บันทึกรายจ่ายคู่รัก</h1></div>
+    <div class="setup">
+      <h2>${isEdit ? 'แก้ไข Web app URL' : 'เชื่อมต่อกับ Google Sheet'}</h2>
+      <p class="sub">หน้านี้สำหรับผู้ดูแลระบบเท่านั้น วาง Web app URL และรหัส ADMIN_KEY ที่ตั้งไว้ใน Script Properties</p>
+      <div class="field"><label>Web app URL</label><input id="in-url" type="text" placeholder="https://script.google.com/macros/s/.../exec" value="${esc(config && config.webAppUrl || '')}"></div>
+      <div class="field"><label>รหัสผู้ดูแล (ADMIN_KEY)</label><input id="in-key" type="password" placeholder="รหัสที่ตั้งไว้" value="${esc(config && config.adminKey || '')}"></div>
+      <button class="primary-btn" id="btn-save-url">เชื่อมต่อ</button>
+    </div>
+  `;
+  document.getElementById('btn-save-url').onclick = async () => {
+    const url = document.getElementById('in-url').value.trim();
+    const key = document.getElementById('in-key').value.trim();
+    if(!url || !key){ alert('กรอก URL และรหัสผู้ดูแลให้ครบ'); return; }
+    config = { webAppUrl: url, adminKey: key };
+    await saveConfig();
+    loadData();
+  };
+}
+
+function computeMonthTotals(){
+  const monthPrefix = new Date().toISOString().slice(0,7);
+  const monthExpenses = data.expenses.filter(e => (e.date||'').indexOf(monthPrefix) === 0);
+  const [name1, name2] = data.partners;
+  const totalP1 = monthExpenses.filter(e=>e.who===name1).reduce((s,e)=>s+e.amount,0);
+  const totalP2 = monthExpenses.filter(e=>e.who===name2).reduce((s,e)=>s+e.amount,0);
+  const totalShared = monthExpenses.filter(e=>e.who==='shared').reduce((s,e)=>s+e.amount,0);
+  return { monthExpenses, totalP1, totalP2, totalShared, grandTotal: totalP1+totalP2+totalShared };
+}
+
+function render(){
+  const { monthExpenses, totalP1, totalP2, totalShared, grandTotal } = computeMonthTotals();
+  const [name1, name2] = data.partners;
+  const sorted = [...data.expenses].sort((a,b)=> b.date.localeCompare(a.date) || b.id - a.id).slice(0, 30);
+
+  app.innerHTML = `
+    <div class="header">
+      <button class="icon-btn" id="btn-settings">ตั้งค่า</button>
+      <p class="eyebrow">${esc(thMonth())}</p>
+      <h1>บันทึกรายจ่ายคู่รัก</h1>
+      <p class="total-label">รวมค่าใช้จ่ายเดือนนี้</p>
+      <p class="total-amount">฿${baht(grandTotal)}</p>
+      <div class="breakdown-row">
+        <div class="breakdown-chip p1"><div class="who">${esc(name1)}</div><div class="amt">฿${baht(totalP1)}</div></div>
+        <div class="breakdown-chip p2"><div class="who">${esc(name2)}</div><div class="amt">฿${baht(totalP2)}</div></div>
+        <div class="breakdown-chip shared"><div class="who">ร่วมกัน</div><div class="amt">฿${baht(totalShared)}</div></div>
+      </div>
+      <button class="add-btn-main" id="btn-toggle-form">${showForm ? 'ปิด' : '+ บันทึกรายจ่าย'}</button>
+    </div>
+
+    ${showForm ? renderExpenseForm() : ''}
+
+    <div class="section-title"><span>แยกตามหมวด (เดือนนี้)</span></div>
+    <div class="cat-bars" id="cat-bars"></div>
+
+    <div class="line-notice">
+      <p>สรุปวันนี้ส่งเข้า LINE ทุกวัน 20:00 น. และสรุปรายเดือนส่งอัตโนมัติทุกวันที่ 1 ของเดือน</p>
+      <div class="btn-row">
+        <button id="btn-test-daily">ทดสอบสรุปวันนี้</button>
+        <button id="btn-test-monthly">ทดสอบสรุปเดือนนี้</button>
+      </div>
+    </div>
+
+    <div class="ledger">
+      <div class="section-title" style="margin:0 0 10px;"><span>รายการล่าสุด</span></div>
+      <div id="ledger-list"></div>
+    </div>
+
+    <div class="footer-links">
+      <button id="btn-manage-cat">จัดการหมวดหมู่</button>
+      <button id="btn-edit-partners">แก้ไขชื่อทั้งคู่</button>
+      <button id="btn-edit-url">แก้ไข Web app URL</button>
+    </div>
+  `;
+
+  renderCategoryBars(monthExpenses);
+  renderLedger(sorted);
+
+  document.getElementById('btn-settings').onclick = () => renderEditPartnersModal();
+  document.getElementById('btn-edit-partners').onclick = () => renderEditPartnersModal();
+  document.getElementById('btn-edit-url').onclick = () => renderSetupUrl(true);
+  document.getElementById('btn-manage-cat').onclick = () => renderManageCategoriesModal();
+  document.getElementById('btn-toggle-form').onclick = () => { showForm = !showForm; render(); };
+
+  document.getElementById('btn-test-daily').onclick = async (ev) => {
+    ev.target.textContent = 'กำลังส่ง...'; ev.target.disabled = true;
+    try{ await api('testSend'); ev.target.textContent = 'ส่งแล้ว ✓'; }
+    catch(e){ ev.target.textContent = 'ส่งไม่สำเร็จ'; }
+    setTimeout(()=>{ ev.target.textContent='ทดสอบสรุปวันนี้'; ev.target.disabled=false; }, 2200);
+  };
+  document.getElementById('btn-test-monthly').onclick = async (ev) => {
+    ev.target.textContent = 'กำลังส่ง...'; ev.target.disabled = true;
+    try{ await api('testSendMonthly'); ev.target.textContent = 'ส่งแล้ว ✓'; }
+    catch(e){ ev.target.textContent = 'ส่งไม่สำเร็จ'; }
+    setTimeout(()=>{ ev.target.textContent='ทดสอบสรุปเดือนนี้'; ev.target.disabled=false; }, 2200);
+  };
+
+  if(showForm) wireExpenseForm();
+}
+
+function renderExpenseForm(){
+  const [name1, name2] = data.partners;
+  const catOptions = data.categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  return `
+    <div class="expense-form">
+      <h3>บันทึกรายจ่าย</h3>
+      <div class="who-toggle3">
+        <button class="who-btn p1 ${formWho===1?'active':''}" data-who="1">${esc(name1)}</button>
+        <button class="who-btn p2 ${formWho===2?'active':''}" data-who="2">${esc(name2)}</button>
+        <button class="who-btn shared ${formWho==='shared'?'active':''}" data-who="shared">ร่วมกัน</button>
+      </div>
+      <div class="cat-row">
+        <select id="in-category">${catOptions}</select>
+        <button class="manage-cat-btn" id="btn-quick-add-cat">+ หมวดใหม่</button>
+      </div>
+      <input type="number" id="in-amount" placeholder="จำนวนเงิน (บาท)" min="0">
+      <input type="text" id="in-note" placeholder="บันทึกช่วยจำ (ไม่บังคับ)">
+      <button class="save-btn" id="btn-save-expense">บันทึกรายจ่าย</button>
+    </div>
+  `;
+}
+
+function wireExpenseForm(){
+  document.querySelectorAll('.who-toggle3 .who-btn').forEach(btn=>{
+    btn.onclick = () => { formWho = btn.dataset.who === 'shared' ? 'shared' : Number(btn.dataset.who); render(); };
+  });
+  document.getElementById('btn-quick-add-cat').onclick = () => {
+    const name = prompt('ตั้งชื่อหมวดใหม่');
+    if(name && name.trim()){
+      api('addCategory', {category: name.trim()}).then(d => { data = d; render(); });
+    }
+  };
+  document.getElementById('btn-save-expense').onclick = async () => {
+    const category = document.getElementById('in-category').value;
+    const amount = parseFloat(document.getElementById('in-amount').value);
+    const note = document.getElementById('in-note').value.trim();
+    if(!amount || amount<=0){ alert('กรอกจำนวนเงินให้ถูกต้อง'); return; }
+    const [name1, name2] = data.partners;
+    const who = formWho === 'shared' ? 'shared' : (formWho===1 ? name1 : name2);
+    data = await api('addExpense', {who, category, amount, note, date: todayISO()});
+    showForm = false;
+    render();
+  };
+}
+
+function renderCategoryBars(monthExpenses){
+  const wrap = document.getElementById('cat-bars');
+  const byCat = {};
+  monthExpenses.forEach(e => { byCat[e.category] = (byCat[e.category]||0) + e.amount; });
+  const cats = Object.keys(byCat).sort((a,b)=>byCat[b]-byCat[a]);
+
+  if(cats.length === 0){
+    wrap.innerHTML = '<div class="empty-state">เดือนนี้ยังไม่มีรายการบันทึกไว้</div>';
+    return;
+  }
+  const max = byCat[cats[0]];
+  wrap.innerHTML = cats.map((cat, i) => {
+    const amt = byCat[cat];
+    const pct = max>0 ? Math.round((amt/max)*100) : 0;
+    return `
+      <div class="cat-bar-row">
+        <div class="top"><span class="name">${esc(cat)}</span><span class="amt">฿${baht(amt)}</span></div>
+        <div class="cat-bar-track"><div class="cat-bar-fill" style="width:${pct}%; background:${catColor(i)}"></div></div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderLedger(list){
+  const wrap = document.getElementById('ledger-list');
+  const [name1] = data.partners;
+  if(list.length===0){ wrap.innerHTML = '<div class="empty-state">ยังไม่มีรายการบันทึกไว้</div>'; return; }
+  wrap.innerHTML = list.map(e => {
+    const stripeClass = e.who === 'shared' ? 'shared' : (e.who === name1 ? 'p1' : 'p2');
+    const whoLabel = e.who === 'shared' ? 'ร่วมกัน' : e.who;
+    return `
+    <div class="entry">
+      <div class="stripe ${stripeClass}"></div>
+      <div class="info">
+        <div class="cat">${esc(e.category)}</div>
+        <div class="meta">${thDate(e.date)} · ${esc(whoLabel)}</div>
+        ${e.note ? `<div class="note">${esc(e.note)}</div>` : ''}
+      </div>
+      <div class="amt">-฿${baht(e.amount)}</div>
+      <button class="del" data-id="${e.id}">✕</button>
+    </div>`;
+  }).join('');
+  wrap.querySelectorAll('.del').forEach(btn=>{
+    btn.onclick = async () => {
+      if(!confirm('ลบรายการนี้เลยไหม?')) return;
+      data = await api('deleteExpense', {id: btn.dataset.id});
+      render();
+    };
+  });
+}
+
+function renderManageCategoriesModal(){
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = `
+    <div class="modal">
+      <h2>จัดการหมวดหมู่</h2>
+      <div id="cat-list-items"></div>
+      <div class="add-cat-row">
+        <input type="text" id="m-new-cat" placeholder="ชื่อหมวดใหม่">
+        <button id="m-add-cat-btn">เพิ่ม</button>
+      </div>
+      <button class="text-btn" id="m-close-cat">ปิด</button>
+    </div>
+  `;
+  document.body.appendChild(back);
+
+  function refreshList(){
+    const listWrap = back.querySelector('#cat-list-items');
+    listWrap.innerHTML = data.categories.map(c => `
+      <div class="cat-list-item">
+        <span>${esc(c)}</span>
+        <button class="del-cat-x" data-cat="${esc(c)}">✕</button>
+      </div>
+    `).join('');
+    listWrap.querySelectorAll('.del-cat-x').forEach(btn=>{
+      btn.onclick = async () => {
+        if(!confirm(`ลบหมวด "${btn.dataset.cat}" เลยไหม (รายการเก่าที่บันทึกไว้จะยังอยู่)`)) return;
+        data = await api('deleteCategory', {category: btn.dataset.cat});
+        refreshList();
+      };
+    });
+  }
+  refreshList();
+
+  back.querySelector('#m-add-cat-btn').onclick = async () => {
+    const input = back.querySelector('#m-new-cat');
+    const name = input.value.trim();
+    if(!name) return;
+    data = await api('addCategory', {category: name});
+    input.value = '';
+    refreshList();
+  };
+  back.querySelector('#m-close-cat').onclick = () => { back.remove(); render(); };
+}
+
+function renderEditPartnersModal(){
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = `
+    <div class="modal">
+      <h2>แก้ไขชื่อทั้งคู่</h2>
+      <div class="field-row">
+        <div class="field"><label>ชื่อคนที่ 1</label><input id="m-p1" type="text" value="${esc(data.partners[0])}"></div>
+        <div class="field"><label>ชื่อคนที่ 2</label><input id="m-p2" type="text" value="${esc(data.partners[1])}"></div>
+      </div>
+      <button class="primary-btn" id="m-save-p">บันทึก</button>
+      <button class="text-btn" id="m-cancel-p">ยกเลิก</button>
+    </div>
+  `;
+  document.body.appendChild(back);
+  back.querySelector('#m-cancel-p').onclick = () => back.remove();
+  back.querySelector('#m-save-p').onclick = async () => {
+    const p1 = back.querySelector('#m-p1').value.trim() || 'คนที่ 1';
+    const p2 = back.querySelector('#m-p2').value.trim() || 'คนที่ 2';
+    data = await api('setPartners', {partner1:p1, partner2:p2});
+    back.remove();
+    render();
+  };
+}
+
+loadConfig();
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
+  });
+}
+</script>
+</body>
+</html>
