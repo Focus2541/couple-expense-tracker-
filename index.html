@@ -107,6 +107,12 @@ select:focus, .expense-form input:focus{outline:none; border-color:var(--cover);
 .field label{display:block; font-size:12px; font-weight:600; color:var(--ink-soft); margin-bottom:5px;}
 .field input{width:100%; padding:11px 12px; border:1.5px solid var(--line); border-radius:8px; font-size:14px; font-family:'Noto Sans Thai',sans-serif; background:#fff; color:var(--ink);}
 .field-row{display:flex; gap:10px;}
+.key-wrap{position:relative;}
+.key-wrap input{padding-right:52px; letter-spacing:3px;}
+.key-wrap input.masked{-webkit-text-security:disc; text-security:disc;}
+.key-toggle{position:absolute; right:6px; top:50%; transform:translateY(-50%); border:0; background:transparent; font-size:18px; cursor:pointer; padding:6px 8px; line-height:1;}
+.key-count{font-size:12px; color:var(--ink-soft); margin-top:5px;}
+.setup-err{background:#F6E0DC; color:#9B3B32; border-radius:8px; padding:10px 12px; font-size:13px; margin-bottom:14px;}
 .field-row .field{flex:1;}
 .setup{padding:26px 22px;}
 .setup h2{font-family:'Noto Serif Thai',serif; font-size:19px; margin:0 0 6px;}
@@ -185,6 +191,13 @@ async function loadData(){
     if(data && data.error){ throw new Error(data.error); }
     render();
   }catch(e){
+    const msg = (e && e.message) || '';
+    if(msg.indexOf('รหัส') !== -1){
+      // รหัสผิด: ล้างรหัสที่จำไว้ทิ้ง แล้วให้พิมพ์ใหม่ทันที
+      if(config){ config.adminKey = ''; await saveConfig(); }
+      renderSetupUrl(true, msg + ' กรุณาพิมพ์รหัสใหม่');
+      return;
+    }
     app.innerHTML = `
       <div class="err">เชื่อมต่อไม่สำเร็จ<br>${esc(e.message || '')}<br><br>ตรวจสอบ Web app URL และรหัสผู้ดูแลอีกครั้ง</div>
       <div style="padding:0 22px;"><button class="text-btn" id="btn-recheck-url">แก้ไข Web app URL</button></div>
@@ -193,20 +206,44 @@ async function loadData(){
   }
 }
 
-function renderSetupUrl(isEdit){
+function renderSetupUrl(isEdit, errMsg){
   app.innerHTML = `
     <div class="header"><p class="eyebrow">ตั้งค่าเริ่มต้น</p><h1>บันทึกรายจ่ายคู่รัก</h1></div>
     <div class="setup">
       <h2>${isEdit ? 'แก้ไข Web app URL' : 'เชื่อมต่อกับ Google Sheet'}</h2>
       <p class="sub">หน้านี้สำหรับผู้ดูแลระบบเท่านั้น วาง Web app URL และรหัส ADMIN_KEY ที่ตั้งไว้ใน Script Properties</p>
+      ${errMsg ? `<div class="setup-err">${esc(errMsg)}</div>` : ''}
       <div class="field"><label>Web app URL</label><input id="in-url" type="text" placeholder="https://script.google.com/macros/s/.../exec" value="${esc(config && config.webAppUrl || '')}"></div>
-      <div class="field"><label>รหัสผู้ดูแล (ADMIN_KEY)</label><input id="in-key" type="password" placeholder="รหัสที่ตั้งไว้" value="${esc(config && config.adminKey || '')}"></div>
+      <div class="field"><label for="in-key">รหัสผู้ดูแล (ADMIN_KEY)</label>
+        <div class="key-wrap">
+          <input id="in-key" name="ck-admin-pin" type="text" class="masked" inputmode="numeric" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" placeholder="พิมพ์รหัสตัวเลข" value="">
+          <button type="button" class="key-toggle" id="btn-key-toggle" aria-label="แสดงรหัส">👁</button>
+        </div>
+        <div class="key-count" id="key-count">ยังไม่ได้พิมพ์รหัส</div>
+      </div>
       <button class="primary-btn" id="btn-save-url">เชื่อมต่อ</button>
     </div>
   `;
+  const keyIn = document.getElementById('in-key');
+  const keyCount = document.getElementById('key-count');
+  const keyToggle = document.getElementById('btn-key-toggle');
+  const updateCount = () => {
+    const n = keyIn.value.replace(/\s/g,'').length;
+    keyCount.textContent = n ? `พิมพ์แล้ว ${n} ตัว` : 'ยังไม่ได้พิมพ์รหัส';
+  };
+  keyIn.addEventListener('input', updateCount);
+  keyToggle.onclick = () => {
+    const masked = keyIn.classList.toggle('masked');
+    keyToggle.textContent = masked ? '👁' : '🙈';
+    keyToggle.setAttribute('aria-label', masked ? 'แสดงรหัส' : 'ซ่อนรหัส');
+    keyIn.focus();
+  };
+  keyIn.addEventListener('keydown', e => { if(e.key === 'Enter') document.getElementById('btn-save-url').click(); });
+  if(document.getElementById('in-url').value) keyIn.focus();
+
   document.getElementById('btn-save-url').onclick = async () => {
     const url = document.getElementById('in-url').value.trim();
-    const key = document.getElementById('in-key').value.trim();
+    const key = document.getElementById('in-key').value.replace(/\s/g,'');
     if(!url || !key){ alert('กรอก URL และรหัสผู้ดูแลให้ครบ'); return; }
     config = { webAppUrl: url, adminKey: key };
     await saveConfig();
