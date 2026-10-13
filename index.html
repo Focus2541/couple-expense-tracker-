@@ -95,6 +95,9 @@ select:focus, .expense-form input:focus{outline:none; border-color:var(--cover);
 .line-notice{margin:20px 18px 0; background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 16px;}
 .line-notice p{font-size:12.5px; color:var(--ink-soft); margin:0 0 10px; line-height:1.6;}
 .line-notice .btn-row{display:flex; gap:8px;}
+.backup-status{font-weight:600; color:var(--cover) !important;}
+.backup-status.none{color:#9B3B32 !important;}
+.backup-link{display:block; text-align:center; font-size:12px; color:var(--cover); margin-top:8px;}
 .line-notice button{flex:1; background:none; border:1px solid var(--cover); color:var(--cover); border-radius:16px; font-size:12px; padding:8px 10px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
 
 .footer-links{display:flex; justify-content:center; gap:16px; margin-top:22px;}
@@ -294,6 +297,16 @@ function render(){
       </div>
     </div>
 
+    <div class="line-notice">
+      <p class="backup-status ${data.backup && data.backup.at ? '' : 'none'}">💾 ${esc((data.backup && data.backup.label) || 'ยังไม่เคยสำรองข้อมูล')}</p>
+      <p>ระบบสำรองข้อมูลลง Google Drive ให้อัตโนมัติทุกวันอาทิตย์ 03:00 น. เฉพาะสัปดาห์ที่มีรายการเปลี่ยน (เก็บ 8 ชุดล่าสุด)</p>
+      <div class="btn-row">
+        <button id="btn-backup">สำรองข้อมูลตอนนี้</button>
+        <button id="btn-download-csv">ดาวน์โหลดลงเครื่อง (.csv)</button>
+      </div>
+      ${data.backup && data.backup.url ? `<a class="backup-link" href="${esc(data.backup.url)}" target="_blank" rel="noopener">เปิดไฟล์สำรองล่าสุดใน Drive ↗</a>` : ''}
+    </div>
+
     <div class="ledger">
       <div class="section-title" style="margin:0 0 10px;"><span>รายการล่าสุด</span></div>
       <div id="ledger-list"></div>
@@ -328,7 +341,42 @@ function render(){
     setTimeout(()=>{ ev.target.textContent='ทดสอบสรุปเดือนนี้'; ev.target.disabled=false; }, 2200);
   };
 
+  document.getElementById('btn-backup').onclick = async (ev) => {
+    const btn = ev.target;
+    btn.textContent = 'กำลังสำรอง...'; btn.disabled = true;
+    try{
+      const d = await api('backup');
+      if(d && d.error) throw new Error(d.error);
+      data = d; render();
+    }catch(e){
+      btn.textContent = 'สำรองไม่สำเร็จ'; alert((e && e.message) || 'สำรองข้อมูลไม่สำเร็จ');
+      setTimeout(()=>{ btn.textContent='สำรองข้อมูลตอนนี้'; btn.disabled=false; }, 2200);
+    }
+  };
+  document.getElementById('btn-download-csv').onclick = () => downloadCsv();
+
   if(showForm) wireExpenseForm();
+}
+
+// สำรองข้อมูลลงเครื่องตัวเองเป็น CSV (เปิดใน Excel/Google Sheets ได้ ภาษาไทยไม่เพี้ยน)
+function downloadCsv(){
+  const cell = v => {
+    const t = String(v === undefined || v === null ? '' : v);
+    return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+  };
+  const head = ['ID','วันที่','ใคร','หมวด','จำนวนเงิน','หมายเหตุ','บันทึกเมื่อ'];
+  const rows = [...data.expenses]
+    .sort((a,b) => (a.localDate||'').localeCompare(b.localDate||'') || a.id - b.id)
+    .map(e => [e.id, e.localDate, e.who === 'shared' ? 'ร่วมกัน' : e.who, e.category, e.amount, e.note, e.recordedAt]);
+  const csv = '\ufeff' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  const d = new Date();
+  const stamp = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'รายจ่ายคู่รัก-' + stamp + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 function renderExpenseForm(){
