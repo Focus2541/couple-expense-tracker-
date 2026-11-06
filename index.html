@@ -58,7 +58,25 @@ body{margin:0; background:var(--paper); font-family:'Noto Sans Thai',sans-serif;
 .who-btn{flex:1; padding:9px 4px; border-radius:8px; border:1.5px solid var(--line); background:#fff; font-size:12.5px; font-weight:600; cursor:pointer; font-family:'Noto Sans Thai',sans-serif; color:var(--ink-soft);}
 .who-btn.active.p1{border-color:var(--p1); background:var(--p1-soft); color:var(--p1);}
 .who-btn.active.p2{border-color:var(--p2); background:var(--p2-soft); color:var(--p2);}
-.who-btn.active.shared{border-color:var(--shared); background:var(--shared-soft); color:#8A6E1F;}
+.who-btn.active.shared, .who-btn.active.half{border-color:var(--shared); background:var(--shared-soft); color:#8A6E1F;}
+.date-row{display:flex; gap:8px; align-items:center;}
+.date-row input{flex:1;}
+.date-row .today-tag{flex:none; font-size:11.5px; color:var(--ink-soft); margin-bottom:8px;}
+.form-msg{font-size:12px; color:var(--danger); min-height:0; margin:2px 0 6px;}
+.pending-wrap{margin:16px 18px 0; background:#FFF8E6; border:1.5px solid var(--gold-light); border-radius:12px; padding:14px 14px 6px;}
+.pending-wrap h3{font-size:14px; margin:0 0 4px; color:#8A6E1F; font-weight:700;}
+.pending-wrap .hint{font-size:11.5px; color:var(--ink-soft); margin:0 0 10px;}
+.pending-card{background:#fff; border:1px solid var(--line); border-radius:10px; padding:11px 12px; margin-bottom:10px;}
+.pending-card .p-top{display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:2px;}
+.pending-card .p-item{font-size:13.5px; font-weight:600; overflow-wrap:anywhere;}
+.pending-card .p-amt{font-size:15px; font-weight:700; font-variant-numeric:tabular-nums; flex:none;}
+.pending-card .p-meta{font-size:11px; color:var(--ink-soft); margin-bottom:8px;}
+.pending-card .p-row{display:flex; gap:6px;}
+.pending-card .p-row select, .pending-card .p-row input{flex:1; min-width:0; margin-bottom:6px; padding:8px 9px; font-size:13px; border:1.5px solid var(--line); border-radius:7px; background:#fff; font-family:'Noto Sans Thai',sans-serif; color:var(--ink);}
+.pending-card .p-actions{display:flex; gap:6px;}
+.pending-card .p-save{flex:1; padding:9px; border:none; border-radius:7px; background:var(--cover); color:var(--paper); font-weight:600; font-size:13px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+.pending-card .p-del{flex:none; padding:9px 12px; border:1px solid var(--line); border-radius:7px; background:#fff; color:var(--danger); font-size:12.5px; cursor:pointer; font-family:'Noto Sans Thai',sans-serif;}
+.pending-card .p-save:disabled{opacity:.6;}
 select, .expense-form input{width:100%; padding:10px 11px; border:1.5px solid var(--line); border-radius:7px; font-size:14px; margin-bottom:8px; font-family:'Noto Sans Thai',sans-serif; background:#fff; color:var(--ink);}
 select:focus, .expense-form input:focus{outline:none; border-color:var(--cover);}
 .cat-row{display:flex; gap:8px;}
@@ -142,7 +160,7 @@ const CONFIG_KEY = 'expense-tracker-config';
 let config = null;
 let data = null;
 let showForm = false;
-let formWho = 1; // 1, 2, or 'shared'
+let formWho = 1; // 1, 2, or 'half' (หารครึ่ง)
 
 const app = document.getElementById('app');
 
@@ -151,6 +169,17 @@ function baht(n){ return Number(n||0).toLocaleString('th-TH'); }
 function todayISO(){ return new Date().toISOString(); }
 function thMonth(){ return new Date().toLocaleDateString('th-TH', {month:'long', year:'numeric'}); }
 function thDate(iso){ return new Date(iso).toLocaleDateString('th-TH', {day:'numeric', month:'short'}); }
+function pad2(n){ return String(n).padStart(2,'0'); }
+function todayLocal(){ const d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth()+1) + '-' + pad2(d.getDate()); }
+function thLocalDate(ld){ return ld ? new Date(ld + 'T12:00:00').toLocaleDateString('th-TH', {day:'numeric', month:'short'}) : ''; }
+function entryDay(e){ return e.localDate || (e.date || '').slice(0,10); }
+// เรียก API แล้วแจ้ง error ที่หลังบ้านส่งกลับมา (ข้อมูลยังอัปเดตตามจริง)
+async function apiSave(action, payload){
+  const d = await api(action, payload);
+  if(d && d.expenses) data = d;
+  if(d && d.error){ alert(d.error); return false; }
+  return true;
+}
 function cssId(s){ return s.replace(/[^a-zA-Z0-9\u0E00-\u0E7F]/g,'_'); }
 const PALETTE = ['#2F6E63','#B0524A','#8A6BAE','#B4922E','#6E8B3D','#A64F7E','#3B6EA5'];
 function catColor(i){ return PALETTE[i % PALETTE.length]; }
@@ -255,8 +284,8 @@ function renderSetupUrl(isEdit, errMsg){
 }
 
 function computeMonthTotals(){
-  const monthPrefix = new Date().toISOString().slice(0,7);
-  const monthExpenses = data.expenses.filter(e => (e.date||'').indexOf(monthPrefix) === 0);
+  const monthPrefix = todayLocal().slice(0,7);
+  const monthExpenses = data.expenses.filter(e => entryDay(e).indexOf(monthPrefix) === 0);
   const [name1, name2] = data.partners;
   const totalP1 = monthExpenses.filter(e=>e.who===name1).reduce((s,e)=>s+e.amount,0);
   const totalP2 = monthExpenses.filter(e=>e.who===name2).reduce((s,e)=>s+e.amount,0);
@@ -267,7 +296,7 @@ function computeMonthTotals(){
 function render(){
   const { monthExpenses, totalP1, totalP2, totalShared, grandTotal } = computeMonthTotals();
   const [name1, name2] = data.partners;
-  const sorted = [...data.expenses].sort((a,b)=> b.date.localeCompare(a.date) || b.id - a.id).slice(0, 30);
+  const sorted = [...data.expenses].sort((a,b)=> entryDay(b).localeCompare(entryDay(a)) || b.id - a.id).slice(0, 30);
 
   app.innerHTML = `
     <div class="header">
@@ -285,6 +314,8 @@ function render(){
     </div>
 
     ${showForm ? renderExpenseForm() : ''}
+
+    ${renderPendings()}
 
     <div class="section-title"><span>แยกตามหมวด (เดือนนี้)</span></div>
     <div class="cat-bars" id="cat-bars"></div>
@@ -356,6 +387,56 @@ function render(){
   document.getElementById('btn-download-csv').onclick = () => downloadCsv();
 
   if(showForm) wireExpenseForm();
+  wirePendings();
+}
+
+// ---------- รายการที่พิมพ์ใน LINE แล้วยังไม่ได้เลือกหมวด ----------
+function whoOptions(selected){
+  const [name1, name2] = data.partners;
+  return [[name1, name1], [name2, name2], ['half', 'หารครึ่ง']]
+    .map(([v, l]) => `<option value="${esc(v)}" ${v === selected ? 'selected' : ''}>${esc(l)}</option>`).join('');
+}
+function renderPendings(){
+  const list = data.pendings || [];
+  if(!list.length) return '';
+  const catOpts = '<option value="">เลือกหมวด…</option>' + data.categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  return `
+    <div class="pending-wrap">
+      <h3>⏳ รอเลือกหมวด (${list.length})</h3>
+      <p class="hint">รายการที่พิมพ์ใน LINE แล้วยังไม่ได้เลือกหมวด เลือกที่นี่ได้เลย ระบบจะจำชื่อไว้ ครั้งหน้าเข้าหมวดให้เอง</p>
+      ${list.map(p => `
+        <div class="pending-card" data-id="${esc(p.id)}">
+          <div class="p-top"><span class="p-item">${esc(p.item || '(ไม่มีชื่อรายการ)')}</span><span class="p-amt">฿${baht(p.amount)}</span></div>
+          <div class="p-meta">${esc(thLocalDate(p.localDate))} · พิมพ์โดย ${esc(p.who)}</div>
+          <div class="p-row">
+            <select class="p-cat">${catOpts}</select>
+            <select class="p-who">${whoOptions(p.who)}</select>
+          </div>
+          <div class="p-row"><input type="date" class="p-date" value="${esc(p.localDate)}" max="${todayLocal()}"></div>
+          <div class="p-actions">
+            <button class="p-save">บันทึก</button>
+            <button class="p-del">ลบทิ้ง</button>
+          </div>
+        </div>`).join('')}
+    </div>`;
+}
+function wirePendings(){
+  document.querySelectorAll('.pending-card').forEach(card => {
+    const id = card.dataset.id;
+    card.querySelector('.p-save').onclick = async (ev) => {
+      const category = card.querySelector('.p-cat').value;
+      if(!category){ alert('เลือกหมวดก่อนนะ'); return; }
+      ev.target.disabled = true; ev.target.textContent = 'กำลังบันทึก...';
+      const ok = await apiSave('resolvePending', { id, category, who: card.querySelector('.p-who').value, localDate: card.querySelector('.p-date').value });
+      render();
+      if(!ok) return;
+    };
+    card.querySelector('.p-del').onclick = async () => {
+      if(!confirm('ลบรายการนี้ทิ้ง (ไม่บันทึก) ใช่ไหม?')) return;
+      await apiSave('deletePending', { id });
+      render();
+    };
+  });
 }
 
 // สำรองข้อมูลลงเครื่องตัวเองเป็น CSV (เปิดใน Excel/Google Sheets ได้ ภาษาไทยไม่เพี้ยน)
@@ -388,14 +469,18 @@ function renderExpenseForm(){
       <div class="who-toggle3">
         <button class="who-btn p1 ${formWho===1?'active':''}" data-who="1">${esc(name1)}</button>
         <button class="who-btn p2 ${formWho===2?'active':''}" data-who="2">${esc(name2)}</button>
-        <button class="who-btn shared ${formWho==='shared'?'active':''}" data-who="shared">ร่วมกัน</button>
+        <button class="who-btn half ${formWho==='half'?'active':''}" data-who="half">หารครึ่ง</button>
+      </div>
+      <div class="date-row">
+        <input type="date" id="in-date" value="${todayLocal()}" max="${todayLocal()}">
+        <span class="today-tag" id="date-tag">วันนี้</span>
       </div>
       <div class="cat-row">
         <select id="in-category">${catOptions}</select>
         <button class="manage-cat-btn" id="btn-quick-add-cat">+ หมวดใหม่</button>
       </div>
       <input type="number" id="in-amount" placeholder="จำนวนเงิน (บาท)" min="0">
-      <input type="text" id="in-note" placeholder="บันทึกช่วยจำ (ไม่บังคับ)">
+      <input type="text" id="in-note" placeholder="รายการ / บันทึกช่วยจำ (ไม่บังคับ)">
       <button class="save-btn" id="btn-save-expense">บันทึกรายจ่าย</button>
     </div>
   `;
@@ -403,8 +488,14 @@ function renderExpenseForm(){
 
 function wireExpenseForm(){
   document.querySelectorAll('.who-toggle3 .who-btn').forEach(btn=>{
-    btn.onclick = () => { formWho = btn.dataset.who === 'shared' ? 'shared' : Number(btn.dataset.who); render(); };
+    btn.onclick = () => {
+      formWho = btn.dataset.who === 'half' ? 'half' : Number(btn.dataset.who);
+      document.querySelectorAll('.who-toggle3 .who-btn').forEach(b => b.classList.toggle('active', b === btn));
+    };
   });
+  const dateIn = document.getElementById('in-date');
+  const tag = document.getElementById('date-tag');
+  dateIn.onchange = () => { tag.textContent = dateIn.value === todayLocal() ? 'วันนี้' : 'ย้อนหลัง'; };
   document.getElementById('btn-quick-add-cat').onclick = () => {
     const name = prompt('ตั้งชื่อหมวดใหม่');
     if(name && name.trim()){
@@ -416,10 +507,14 @@ function wireExpenseForm(){
     const amount = parseFloat(document.getElementById('in-amount').value);
     const note = document.getElementById('in-note').value.trim();
     if(!amount || amount<=0){ alert('กรอกจำนวนเงินให้ถูกต้อง'); return; }
+    const localDate = document.getElementById('in-date').value || todayLocal();
+    if(localDate > todayLocal()){ alert('เลือกวันที่ในอนาคตไม่ได้'); return; }
     const [name1, name2] = data.partners;
-    const who = formWho === 'shared' ? 'shared' : (formWho===1 ? name1 : name2);
-    data = await api('addExpense', {who, category, amount, note, date: todayISO()});
-    showForm = false;
+    const who = formWho === 'half' ? 'half' : (formWho===1 ? name1 : name2);
+    const btn = document.getElementById('btn-save-expense');
+    btn.disabled = true; btn.textContent = 'กำลังบันทึก...';
+    const ok = await apiSave('addExpense', {who, category, amount, note, localDate});
+    if(ok) showForm = false;
     render();
   };
 }
@@ -459,7 +554,7 @@ function renderLedger(list){
       <div class="stripe ${stripeClass}"></div>
       <div class="info">
         <div class="cat">${esc(e.category)}</div>
-        <div class="meta">${thDate(e.date)} · ${esc(whoLabel)}</div>
+        <div class="meta">${thLocalDate(entryDay(e))} · ${esc(whoLabel)}</div>
         ${e.note ? `<div class="note">${esc(e.note)}</div>` : ''}
       </div>
       <div class="amt">-฿${baht(e.amount)}</div>
