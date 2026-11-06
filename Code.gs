@@ -13,6 +13,8 @@
  *   PARTNER2_LINE_ID           = userId ของคนที่ 2 (เหมือนกัน)
  *   LINE_TARGET_ID             = (ไม่บังคับ) groupId ที่จะส่งแจ้งเตือนเข้ากลุ่มด้วย ใช้เป็น fallback
  *                                 เฉพาะตอนที่ยังไม่ได้ตั้ง PARTNER1_LINE_ID/PARTNER2_LINE_ID เลย
+ *   ADMIN_KEY                  = รหัสสำหรับเข้าหน้าแอป (Web app)
+ *   BACKUP_FOLDER_ID           = (ระบบตั้งเอง) โฟลเดอร์ Google Drive ที่เก็บไฟล์สำรอง
  */
 
 const SHEET_CATEGORIES = 'Categories';
@@ -117,15 +119,19 @@ function doGet(e) {
   let result;
 
   // ล็อกหลังบ้าน: ทุกคำสั่งผ่าน Web app URL ต้องมีรหัส ADMIN_KEY ที่โฟกัสตั้งไว้เท่านั้น
-  const adminKey = PropertiesService.getScriptProperties().getProperty('ADMIN_KEY');
+  const adminKey = (PropertiesService.getScriptProperties().getProperty('ADMIN_KEY') || '').trim();
   if (!adminKey) {
     result = { error: 'ยังไม่ได้ตั้ง ADMIN_KEY ใน Script Properties ระบบหลังบ้านถูกล็อกไว้' };
-  } else if (p.key !== adminKey) {
+  } else if (String(p.key || '').trim() !== adminKey) {
     result = { error: 'รหัสไม่ถูกต้อง' };
   } else if (action === 'data') {
     result = getAllData_();
   } else if (action === 'addExpense') {
-    addExpense_(p.who, p.category, p.amount, p.note, p.date);
+    result = addExpenseFromApp_(p) || getAllData_();
+  } else if (action === 'resolvePending') {
+    result = resolvePendingFromApp_(p) || getAllData_();
+  } else if (action === 'deletePending') {
+    deletePending_(p.id);
     result = getAllData_();
   } else if (action === 'deleteExpense') {
     deleteExpense_(p.id);
@@ -142,6 +148,13 @@ function doGet(e) {
     props.setProperty('PARTNER2', p.partner2 || 'คนที่ 2');
     syncDashboardNames_();
     result = getAllData_();
+  } else if (action === 'backup') {
+    try {
+      backupNow_();
+      result = getAllData_();
+    } catch (err) {
+      result = { error: 'สำรองข้อมูลไม่สำเร็จ: ' + err.message };
+    }
   } else if (action === 'testSend') {
     dailyLineSummary();
     result = { ok: true };
@@ -234,7 +247,11 @@ function getAllData_() {
   return {
     categories: categoryRows,
     expenses: expenseRows,
-    partners: [props.getProperty('PARTNER1'), props.getProperty('PARTNER2')]
+    partners: [props.getProperty('PARTNER1'), props.getProperty('PARTNER2')],
+    backup: getBackupStatus_(),
+    pendings: getPendings_(null).map(x => ({
+      id: x.id, amount: x.amount, item: x.item || '', localDate: x.localDate, who: resolveWho_(x.userId, props)
+    }))
   };
 }
 
@@ -403,8 +420,17 @@ function isAdmin_(userId, props) {
   return !!userId && userId === adminId;
 }
 
+// ใครลบรายการไหนได้บ้าง: โฟกัสลบได้ทุกรายการ, อ๋อมลบได้เฉพาะรายการของตัวเอง
+function canDeleteExpense_(expense, senderUserId, props) {
+  if (isAdmin_(senderUserId, props)) return true;
+  const slot = resolveSenderSlot_(senderUserId, props);
+  if (!slot) return false;
+  return expense.who === props.getProperty(slot);
+}
+
 // คำสั่งที่แก้ไข/ลบ/ตั้งค่าข้อมูล ใช้ได้เฉพาะผู้ดูแลระบบ
-const ADMIN_ACTIONS_ = ['delete_last', 'delete_pick', 'fix_category', 'fix_amount', 'set_shared', 'split_half', 'delete_category', 'rename_self', 'set_timezone'];
+// (delete_pick ไม่อยู่ในลิสต์นี้ เพราะอ๋อมใช้ได้ด้วย แต่จะเห็นเฉพาะรายการของตัวเอง)
+const ADMIN_ACTIONS_ = ['delete_last', 'fix_category', 'fix_amount', 'set_shared', 'split_half', 'delete_category', 'rename_self', 'set_timezone'];
 
 const HELP_TEXT_ =
   'พิมพ์บอกรายการได้เลยค่ะ เช่น:\n' +
@@ -417,9 +443,15 @@ const HELP_TEXT_ =
   'พิมพ์บอกได้ตามธรรมชาติเลยค่ะ ไม่ต้องพิมพ์ให้ตรงคำเป๊ะๆ เช่น:\n' +
   '• "ขอดูสรุปหน่อย" / "สรุปเดือนนี้" → การ์ดสรุปพร้อมเทียบเดือนก่อน\n' +
   '• "ดูค่าน้ำมันเดือนนี้" / "ค่ากินของอ๋อมเดือนที่แล้ว" / "เดือนนี้ฉันจ่ายอะไรไปบ้าง" → ค้นหารายการ\n' +
+  '💄 เครื่องสำอางของอ๋อม: ซื้อแล้วพิมพ์ตามปกติ เช่น "ลิป MAC 890" ระบบเพิ่มเข้าคลังให้เอง\n' +
+  '• "เครื่องสำอาง" ดูคลัง · "สรุปเครื่องสำอาง" ดูยอดใช้จ่าย · "งบเครื่องสำอาง 1500" ตั้งงบรายเดือน\n' +
+  '• "เปิดใช้ ลิป" · "ลิปหมดแล้ว" · "ทิ้ง มาสคาร่า" · "กันแดด หมดอายุ 05/2027" · "เพิ่มเครื่องสำอาง เซรั่ม Klairs" (ของที่มีอยู่แล้ว)\n' +
+  '• ถ้าน้องออมไม่แน่ใจหมวด จะขึ้นปุ่มให้เลือก (เลือกครั้งเดียว ครั้งหน้าจำให้เอง) · ลืมกด พิมพ์ "รอเลือกหมวด" · ล้างที่ค้าง พิมพ์ "ล้างรอเลือกหมวด"\n' +
+  '• "ลบ" → แสดงรายการวันนี้ให้กดปุ่มเลือกลบ (อ๋อมเห็นเฉพาะรายการของตัวเอง, "ลบของเมื่อวาน" เพื่อดูวันอื่น, "ยกเลิก" ถ้าไม่ลบแล้ว)\n' +
   'คำสั่งด้านล่างนี้ (แก้/ลบ/ตั้งค่า) ใช้ได้เฉพาะผู้ดูแลระบบ:\n' +
-  '• "ลบ" → แสดงรายการวันนี้ให้กดปุ่มเลือกลบทีละรายการ ("ลบของเมื่อวาน" เพื่อดูวันอื่น)\n' +
   '• "ลบล่าสุด" / "เอารายการที่เพิ่งจดออก" → ลบรายการล่าสุดทันที\n' +
+  '• "เครดิต AI" → ดูว่าเดือนนี้ใช้ AI ไปกี่ครั้ง\n' +
+  '• "สำรองข้อมูล" → สำรองข้อมูลทั้งหมดลง Google Drive ทันที (ปกติระบบสำรองให้เองทุกวันอาทิตย์ 03:00)\n' +
   '• "แก้ไขเป็นหมวดค่ากิน" / "เปลี่ยนหมวดล่าสุดเป็นค่าเที่ยว"\n' +
   '• "แก้ยอดเป็น 417.06" / "ยอดที่ถูกต้องคือ 500"\n' +
   '• "หารครึ่ง" / "คนละครึ่ง" / "ร่วมกัน" (พิมพ์เดี่ยวๆ หลังบันทึกไปแล้ว) → แยกรายการล่าสุดเป็นคนละครึ่งจริงๆ\n' +
@@ -429,6 +461,15 @@ const HELP_TEXT_ =
 
 function handleExpenseMessage_(ev, senderUserId, props) {
   const text = (ev.message.text || '').trim();
+
+  // ยืมเงินตัวเอง (ส่วนตัว เห็นคนเดียว) ต้องเช็คก่อนทุกอย่าง กันไม่ให้หลุดไปบันทึกเป็นรายจ่ายปกติ
+  if (handleSelfLoanMessage_(ev, text, senderUserId, props)) return;
+
+  // กำลังรอให้พิมพ์ชื่อหมวดใหม่ (หลังกดปุ่ม "➕ หมวดใหม่")
+  if (handleAwaitCategory_(ev, text, senderUserId, props)) return;
+
+  // เครื่องสำอาง (คลัง/เปิดใช้/หมดแล้ว/สรุป/งบ)
+  if (handleCosmeticsMessage_(ev, text, senderUserId, props)) return;
 
   // ทางลัดคำที่พิมพ์บ่อยที่สุดแบบตรงตัว (ตอบทันทีไม่ต้องรอ AI)
   if (text === 'สรุป' || text === 'สรุปเดือนนี้') {
@@ -444,20 +485,59 @@ function handleExpenseMessage_(ev, senderUserId, props) {
     return;
   }
   if (text === 'ลบ' || text === 'ลบรายการ') {
+    // ใช้ได้ทั้งสองคน: โฟกัสเห็นทุกรายการ อ๋อมเห็นเฉพาะรายการของตัวเอง
+    showDeletePicker_(ev.replyToken, localDatePrefix_(new Date(), 'yyyy-MM-dd'), senderUserId, props);
+    return;
+  }
+  if (text === 'ยกเลิก' || text === 'ไม่ลบแล้ว') {
+    replyLine_(ev.replyToken, 'โอเคค่ะ ไม่ลบอะไรค่ะ 👌');
+    return;
+  }
+  if (text === 'สำรองข้อมูล' || text.toLowerCase() === 'backup') {
     if (!isAdmin_(senderUserId, props)) {
-      replyLine_(ev.replyToken, 'คำสั่งแก้ไข/ลบ/ตั้งค่า ใช้ได้เฉพาะผู้ดูแลระบบค่ะ ถ้าบันทึกผิด แจ้งโฟกัสให้ช่วยแก้ได้เลยนะคะ');
+      replyLine_(ev.replyToken, '💾 ' + backupLabel_() + '\n(ระบบสำรองให้อัตโนมัติทุกวันอาทิตย์ค่ะ ส่วนการสั่งสำรองเองใช้ได้เฉพาะผู้ดูแลระบบ)');
       return;
     }
-    showDeletePicker_(ev.replyToken, localDatePrefix_(new Date(), 'yyyy-MM-dd'));
+    try {
+      const r = backupNow_();
+      replyLine_(ev.replyToken,
+        `💾 สำรองข้อมูลเสร็จแล้วค่ะ ✅\n${backupLabel_()}\n\nเก็บใน Google Drive โฟลเดอร์ "${BACKUP_FOLDER_NAME}" (เก็บ ${BACKUP_KEEP} ชุดล่าสุด)\n${r.url}`);
+    } catch (err) {
+      replyLine_(ev.replyToken, '🔧 (โหมดตรวจสอบชั่วคราว)\nสำรองข้อมูลไม่สำเร็จ:\n' + err);
+    }
     return;
   }
   if (text === 'บันทึกรายจ่าย') {
     replyLine_(ev.replyToken, 'พิมพ์บอกรายการพร้อมจำนวนเงินได้เลยค่ะ เช่น "กินข้าว 150"');
     return;
   }
+  if (/^(ล้าง|ยกเลิก)(รายการ)?รอเลือกหมวด(ทั้งหมด)?$/.test(text.replace(/\s+/g, ''))) {
+    replyLine_(ev.replyToken, clearPendingsText_(clearPendings_(senderUserId)));
+    return;
+  }
+  if (text === 'รอเลือกหมวด' || text === 'เลือกหมวด') {
+    showNextPending_(ev.replyToken, senderUserId);
+    return;
+  }
+  if (/^เครดิต\s*(ai)?$/i.test(text)) {
+    replyLine_(ev.replyToken, isAdmin_(senderUserId, props) ? aiUsageText_() : 'คำสั่งนี้ใช้ได้เฉพาะผู้ดูแลระบบค่ะ');
+    return;
+  }
+
+  // ข้อความแบบ "ชื่อ ตัวเลข" อ่านเองไม่ใช้เครดิต (ไม่แน่ใจหมวดจะขึ้นปุ่มให้เลือก)
+  if (tryLocalExpense_(ev, text, senderUserId, props)) return;
 
   const data = getAllData_();
   const parsed = parseWithClaude_(text, data.categories);
+  if (parsed) parsed._text = text;   // เก็บข้อความต้นฉบับไว้ตรวจซ้ำก่อนทำคำสั่งที่ลบข้อมูล
+
+  if (!parsed && LAST_AI_ERROR_) {
+    const kind = aiErrorKind_(LAST_AI_ERROR_);
+    replyLine_(ev.replyToken, aiErrorUserText_(kind) +
+      '\n\nลองพิมพ์แบบสั้นๆ "ชื่อ ตัวเลข" แทน เช่น "ค่าน้ำมัน 350" (แบบนี้บันทึกได้แม้ AI ใช้ไม่ได้)\nคำสั่ง สรุป · ลบ · วิธีใช้ ยังใช้ได้ตามปกติ');
+    notifyAdminAiProblem_(kind);
+    return;
+  }
 
   if (!parsed || parsed.type === 'none') {
     if (ev.replyToken) {
@@ -487,13 +567,22 @@ function dispatchCommand_(parsed, senderUserId, props, replyToken) {
 
   // คำสั่งแก้ไข/ลบ/ตั้งค่า ใช้ได้เฉพาะโฟกัส (ผู้ดูแลระบบ)
   if (ADMIN_ACTIONS_.indexOf(action) !== -1 && !isAdmin_(senderUserId, props)) {
-    replyLine_(replyToken, 'คำสั่งแก้ไข/ลบ/ตั้งค่า ใช้ได้เฉพาะผู้ดูแลระบบค่ะ ถ้าบันทึกผิด แจ้งโฟกัสให้ช่วยแก้ได้เลยนะคะ');
+    replyLine_(replyToken, 'คำสั่งแก้ไข/ลบ/ตั้งค่า ใช้ได้เฉพาะผู้ดูแลระบบค่ะ ถ้าบันทึกผิด พิมพ์ "ลบ" เพื่อเลือกลบรายการของตัวเอง หรือแจ้งโฟกัสให้ช่วยแก้ได้เลยนะคะ');
+    return;
+  }
+
+  // กันพลาด: คำสั่งที่ลบข้อมูลทันที ต้องมีคำที่สื่อว่า "ลบ" จริงในข้อความ
+  // (เคยเกิดกรณี "ทิ้ง ลิป" แล้ว AI ตีความเป็นลบรายการล่าสุด ทำให้รายจ่ายหาย)
+  const rawText = String(parsed._text || '');
+  const DELETE_WORDS = /ลบ|เอา.*ออก|ยกเลิกรายการ|ไม่เอาหมวด|delete/i;
+  if ((action === 'delete_last' || action === 'delete_category') && !DELETE_WORDS.test(rawText)) {
+    replyLine_(replyToken, 'น้องออมไม่แน่ใจว่าต้องการลบรายการไหมค่ะ เลยยังไม่ได้ลบอะไร\nถ้าจะลบรายจ่าย พิมพ์ "ลบ" แล้วกดเลือก หรือพิมพ์ "ลบล่าสุด"\nถ้าจะเอาเครื่องสำอางออกจากคลัง พิมพ์ "ทิ้ง ชื่อของ"');
     return;
   }
 
   if (action === 'delete_pick') {
     const d = /^\d{4}-\d{2}-\d{2}$/.test(parsed.pickDate || '') ? parsed.pickDate : localDatePrefix_(new Date(), 'yyyy-MM-dd');
-    showDeletePicker_(replyToken, d);
+    showDeletePicker_(replyToken, d, senderUserId, props);
     return;
   }
   if (action === 'search') {
@@ -551,7 +640,15 @@ function handleImageMessage_(ev, senderUserId, props) {
   const mimeType = blob.getContentType() || 'image/jpeg';
 
   const data = getAllData_();
+  countAiUsage_('image');
   const parsed = parseImageWithClaude_(base64Data, mimeType, data.categories);
+
+  if (parsed && parsed.type === 'ai_error') {
+    replyLine_(ev.replyToken, aiErrorUserText_(parsed.kind).replace('อ่านข้อความนี้', 'อ่านสลิปนี้') +
+      '\n\nพิมพ์ยอดเองแทนได้เลยค่ะ เช่น "ค่ากิน 150"');
+    notifyAdminAiProblem_(parsed.kind);
+    return;
+  }
 
   if (parsed && parsed.type === 'debug_error') {
     replyLine_(ev.replyToken, '🔧 (โหมดตรวจสอบชั่วคราว)\n' + parsed.debug);
@@ -585,7 +682,7 @@ function resolveExpenseDate_(parsed) {
   return { iso: now.toISOString(), localDate: localDatePrefix_(now, 'yyyy-MM-dd') };
 }
 
-function logParsedResult_(parsed, senderUserId, props, replyToken) {
+function logParsedResult_(parsed, senderUserId, props, replyToken, opts) {
   if (parsed.splitHalf) {
     logSplitHalfExpense_(parsed, props, replyToken);
     return;
@@ -614,6 +711,11 @@ function logParsedResult_(parsed, senderUserId, props, replyToken) {
     }
   }
 
+  // เครื่องสำอาง: ใช้ชื่อสินค้าเป็นหมายเหตุ จะได้รู้ว่าซื้ออะไรในสรุป
+  if (category === COSMETIC_CATEGORY && parsed.itemName && note.indexOf(parsed.itemName) === -1) {
+    note = note ? parsed.itemName + ' · ' + note : parsed.itemName;
+  }
+
   addExpense_(who, category, amount, note, resolved.iso, resolved.localDate, new Date().toISOString());
   addCategory_(category);
 
@@ -627,8 +729,19 @@ function logParsedResult_(parsed, senderUserId, props, replyToken) {
   const labelDate = new Date(resolved.localDate + 'T12:00:00');
   const dateLabel = isBackdated ? ` (บันทึกย้อนหลังวันที่ ${Utilities.formatDate(labelDate, getActiveTimezone_(), 'd MMM yyyy')})` : '';
 
-  replyLine_(replyToken,
-    `จดสำเร็จ ✅${dateLabel}\n-${Number(amount).toLocaleString('th-TH')} บาท · ${category} (${whoLabel})${note ? '\n"' + note + '"' : ''}\n\nเดือนนี้หมวด "${category}" ของ${whoLabel} รวม: ${categoryTotal.toLocaleString('th-TH')} บาท`);
+  const baseText = `จดสำเร็จ ✅${dateLabel}\n-${Number(amount).toLocaleString('th-TH')} บาท · ${category} (${whoLabel})${note ? '\n"' + note + '"' : ''}\n\nเดือนนี้หมวด "${category}" ของ${whoLabel} รวม: ${categoryTotal.toLocaleString('th-TH')} บาท` + ((opts && opts.suffix) || '');
+
+  // ซื้อเครื่องสำอาง (ของอ๋อม): เพิ่มเข้าคลังอัตโนมัติ + บอกงบ
+  if (category === COSMETIC_CATEGORY && who === cosmeticOwnerName_(props)) {
+    try {
+      const extra = afterCosmeticPurchase_(parsed, amount, resolved.localDate, props);
+      sendLineMessages_('reply', replyToken, [withQuickReply_({ type: 'text', text: baseText + extra.text }, extra.quick)]);
+      return;
+    } catch (e) {
+      Logger.log('afterCosmeticPurchase_ error: ' + e);
+    }
+  }
+  replyLine_(replyToken, baseText);
 }
 
 // ---------- บันทึกรายจ่ายแบบ "หารครึ่ง" จริงๆ: แยกเป็น 2 รายการของแต่ละคนทันที ----------
@@ -714,6 +827,8 @@ function fixCategoryAtPosition_(position, newCategory, replyToken) {
   const oldCategory = target.category;
   updateExpenseCategory_(target.id, newCategory);
   addCategory_(newCategory);
+  // จำไว้ด้วย ครั้งหน้าพิมพ์ชื่อเดิมจะเข้าหมวดที่แก้ให้เอง
+  if (target.note && target.note.length <= 30 && target.note.indexOf('≈') === -1) learnKeyword_(target.note, newCategory);
 
   const fresh = getAllData_();
   const monthPrefix = localDatePrefix_(new Date(), 'yyyy-MM');
@@ -897,14 +1012,16 @@ function parseWithClaude_(text, categories) {
     '1. ถ้าชื่อร้าน/รายละเอียดสื่อถึงอาหารหรือร้านอาหารชัดเจน (มีคำว่า ร้าน, ครัว, เฮือน, ก๋วยเตี๋ยว, หมู, ไก่, ข้าว, ส้มตำ, อาหารตามสั่ง ฯลฯ) → หมวด "ค่ากิน"\n' +
     '2. ถ้าเป็นชื่อร้าน/แบรนด์ปั๊มน้ำมันชัดเจน เช่น PT, ปตท., PTT, บางจาก, เชลล์ (Shell), เอสโซ่ (Esso), คาลเท็กซ์ (Caltex), ซัสโก้ (Susco), หรือคำว่า "Max Card"/"แมกซ์ การ์ด" → หมวด "ค่าน้ำมัน" (สร้างหมวดนี้ถ้ายังไม่มี)\n' +
     '3. ถ้าเป็นการซื้อเครื่องดื่มโดยตรงเท่านั้น (มีคำว่า ชานม กาแฟ น้ำหวาน น้ำอัดลม สมูทตี้ ชัดเจน) → หมวด "ค่าน้ำ" — ห้ามใช้หมวดนี้เป็นค่าเริ่มต้นเวลาไม่แน่ใจ ใช้เฉพาะกรณีชัดเจนว่าเป็นเครื่องดื่มเท่านั้น (หมวด "ค่าน้ำ" ไม่เกี่ยวกับค่าน้ำประปา ถ้าเป็นบิลน้ำประปา/ค่าน้ำมิเตอร์ ให้ใช้หมวด "ค่าน้ำประปา" แยกต่างหากแทน)\n' +
-    '4. ถ้าไม่เข้าเงื่อนไขข้างต้นเลย ให้เลือกหมวดที่ใกล้เคียงที่สุดจากลิสต์ที่มีอยู่ หรือตั้งชื่อหมวดใหม่สั้นๆที่ตรงความหมายที่สุด\n\n' +
+'4. ถ้าเป็นเครื่องสำอางหรือสกินแคร์ (ลิป ลิปสติก ทินท์ รองพื้น คุชชั่น แป้ง มาสคาร่า อายไลเนอร์ อายแชโดว์ บลัช คอนซีลเลอร์ ที่เขียนคิ้ว เซรั่ม โทนเนอร์ ครีมบำรุง มอยส์เจอไรเซอร์ ครีมกันแดด โฟม/คลีนซิ่งล้างหน้า มาส์กหน้า น้ำหอม) หรือซื้อจากร้านเครื่องสำอาง เช่น Eveandboy, Beautrium, Sephora, Konvy → หมวด "เครื่องสำอาง" เสมอ (สร้างหมวดนี้ถ้ายังไม่มี ห้ามใส่หมวด ของใช้)\n' +
+    '5. ถ้าไม่เข้าเงื่อนไขข้างต้นเลย ให้เลือกหมวดที่ใกล้เคียงที่สุดจากลิสต์ที่มีอยู่ หรือตั้งชื่อหมวดใหม่สั้นๆที่ตรงความหมายที่สุด\n\n' +
     'ข้อความที่ได้รับมาอาจเป็นได้ 3 แบบ:\n' +
     '1) การบันทึกรายจ่ายใหม่ เช่น "กินข้าว 150", "ชานมไข่มุก 65", "ค่าเช่าบ้านร่วมกัน 3000" (splitHalf), "หารกันค่าเน็ต 600" (splitHalf), "ค่าน้ำมัน 700 หารครึ่ง" (splitHalf), "กินข้าว 150 เมื่อวาน", "ค่าน้ำมัน 300 เมื่อวานซืน", "กินข้าว 100 เมื่อ 3 วันก่อน", "กินราเมง 1200 เยน", "ค่าที่พัก 80 ดอลลาร์"\n' +
     '2) คำสั่งจัดการข้อมูล — ไม่จำเป็นต้องพิมพ์ตรงคำเป๊ะ ให้ตีความเจตนาจากความหมายทั่วไป เช่น "ลบอันนี้ที", "เอารายการล่าสุดออก" (ลบรายการล่าสุดทันที → action delete_last), "ลบ", "อยากลบรายการวันนี้", "เลือกลบ", "ลบของเมื่อวาน", "ลบรายการวันที่ 3" (อยากเลือกเองว่าจะลบรายการไหนของวันนั้น → action delete_pick), "แก้ไขเป็นหมวดค่ากิน", "เปลี่ยนหมวดล่าสุดเป็นค่าเที่ยว", "แก้ยอดเป็น 417.06", "ยอดที่ถูกต้องคือ 500 ไม่ใช่ 300", "หารครึ่ง"/"คนละครึ่ง"/"ร่วมกัน"/"หารกัน" (พิมพ์เดี่ยวๆ หลังเพิ่งบันทึกไป ความหมายเดียวกันหมด คืออยากให้รายการล่าสุดแยกเป็นคนละครึ่งจริงๆ → action split_half), "ลบสลิปนี้ออก", "ไม่เอาหมวดของใช้แล้ว", "ลบหมวดของใช้ออกไปเลย", "เปลี่ยนชื่อฉันเป็นปาล์ม", "อยู่ญี่ปุ่น", "เปลี่ยนเขตเวลาเป็นโตเกียว", "กลับไทยแล้ว" (ตั้ง/รีเซ็ตเขตเวลาตอนไปต่างประเทศ), "ขอดูสรุปหน่อย", "สรุปวันนี้ยังไง", "วิธีใช้เป็นยังไง", "ดูค่าน้ำมันเดือนนี้", "ค่ากินของอ๋อมเดือนที่แล้ว", "เดือนนี้ฉันจ่ายอะไรไปบ้าง" (ค้นหารายการ → action search) ล้วนถือเป็นคำสั่งจัดการข้อมูลทั้งสิ้น\n' +
-    '3) ข้อความทั่วไปที่ไม่เกี่ยวข้องเลย เช่น คำทักทาย คำถามทั่วไป\n\n' +
+    '3) ข้อความทั่วไปที่ไม่เกี่ยวข้องเลย เช่น คำทักทาย คำถามทั่วไป\n' +
+    'ข้อห้าม: คำว่า "ทิ้ง" / "หมดแล้ว" / "หมดอายุ" เป็นคำสั่งของคลังเครื่องสำอาง ไม่ใช่การลบรายจ่าย ห้ามตอบเป็น delete_last หรือ delete_category เด็ดขาด ให้ตอบ {"type":"none"} แทน\n\n' +
     'ตอบ JSON ตามแบบใดแบบหนึ่งนี้เท่านั้น (ห้ามใส่ฟิลด์อื่นนอกเหนือจากนี้):\n\n' +
     'แบบที่ 1 (บันทึกรายจ่าย):\n' +
-    '{"type":"expense","amount":ตัวเลข,"category":"ชื่อหมวดที่ใกล้เคียงที่สุดจากลิสต์ หรือชื่อหมวดใหม่สั้นๆถ้าไม่มีหมวดไหนใกล้เคียง","shared":true หรือ false,"splitHalf":true หรือ false,"daysAgo":จำนวนวันย้อนหลังจากวันนี้ (0 ถ้าไม่ได้พูดถึงเวลาหรือหมายถึงวันนี้/เมื่อกี้; "เมื่อวาน"=1; "เมื่อวานซืน"=2; "X วันก่อน"/"เมื่อ X วันก่อน"=X),"currency":"รหัสสกุลเงิน ISO 3 ตัวอักษรตัวพิมพ์ใหญ่ เช่น THB, JPY, USD, EUR, KRW (ค่าเริ่มต้นคือ THB ถ้าไม่ได้พูดถึงสกุลเงินอื่นชัดเจน เช่นมีคำว่า เยน, ดอลลาร์, ยูโร, วอน หรือสัญลักษณ์ ¥ $ € ₩ ก็ให้ใส่รหัสตามนั้น ไม่ต้องคำนวณแปลงเป็นบาทเอง ใส่ตัวเลข amount ตามสกุลเงินเดิมตรงๆ ระบบจะแปลงให้เอง)","note":"รายละเอียดสั้นๆถ้ามี ไม่งั้นเป็นค่าว่าง"}\n' +
+    '{"type":"expense","amount":ตัวเลข,"category":"ชื่อหมวดที่ใกล้เคียงที่สุดจากลิสต์ หรือชื่อหมวดใหม่สั้นๆถ้าไม่มีหมวดไหนใกล้เคียง","shared":true หรือ false,"splitHalf":true หรือ false,"daysAgo":จำนวนวันย้อนหลังจากวันนี้ (0 ถ้าไม่ได้พูดถึงเวลาหรือหมายถึงวันนี้/เมื่อกี้; "เมื่อวาน"=1; "เมื่อวานซืน"=2; "X วันก่อน"/"เมื่อ X วันก่อน"=X),"currency":"รหัสสกุลเงิน ISO 3 ตัวอักษรตัวพิมพ์ใหญ่ เช่น THB, JPY, USD, EUR, KRW (ค่าเริ่มต้นคือ THB ถ้าไม่ได้พูดถึงสกุลเงินอื่นชัดเจน เช่นมีคำว่า เยน, ดอลลาร์, ยูโร, วอน หรือสัญลักษณ์ ¥ $ € ₩ ก็ให้ใส่รหัสตามนั้น ไม่ต้องคำนวณแปลงเป็นบาทเอง ใส่ตัวเลข amount ตามสกุลเงินเดิมตรงๆ ระบบจะแปลงให้เอง)","note":"รายละเอียดสั้นๆถ้ามี ไม่งั้นเป็นค่าว่าง","itemName":"ชื่อสินค้าสั้นๆ พร้อมยี่ห้อถ้ามี (ใส่เฉพาะเมื่อหมวดเป็น เครื่องสำอาง เช่น ลิป MAC Ruby Woo หรือ กันแดด Biore ไม่งั้นเป็นค่าว่าง)"}\n' +
     'สำคัญ: ถ้าข้อความสื่อว่าเป็นค่าใช้จ่ายร่วมของทั้งคู่ในความหมายใดก็ตาม — ไม่ว่าจะมีคำว่า "ร่วมกัน", "หารกัน", "ด้วยกัน", "หารครึ่ง", "คนละครึ่ง", "แบ่งครึ่ง", "แบ่งจ่ายคนละครึ่ง" — ให้ตอบ "splitHalf":true เสมอ (ทุกคำเหล่านี้ถือว่าความหมายเดียวกันหมด คือต้องการแบ่งจ่ายคนละครึ่งจริงๆ แยกเป็นของแต่ละคน) และ "shared" ให้เป็น false เสมอ (ไม่ต้องใช้ "shared":true อีกต่อไปสำหรับการบันทึกรายจ่ายใหม่)\n' +
     'ห้ามคำนวณ/หารตัวเลขเองเด็ดขาดไม่ว่ากรณีใด ให้ใส่ "amount" เท่ากับจำนวนเงินเต็มที่ปรากฏในข้อความเสมอ เช่น "ค่าน้ำมัน 700 หารครึ่ง" หรือ "ค่าน้ำมัน 700 ร่วมกัน" ต้องได้ amount:700 (ไม่ใช่ 350) และ splitHalf:true เหมือนกัน — ระบบฝั่งหลังบ้านจะเป็นคนคำนวณหารเอง ไม่ใช่หน้าที่ของคุณ\n\n' +
     'แบบที่ 2 (คำสั่งจัดการข้อมูล):\n' +
@@ -919,6 +1036,8 @@ function parseWithClaude_(text, categories) {
     system: sys,
     messages: [{ role: 'user', content: text }]
   };
+  countAiUsage_('text');
+  LAST_AI_ERROR_ = null;
 
   const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
     method: 'post',
@@ -930,6 +1049,7 @@ function parseWithClaude_(text, categories) {
 
   if (res.getResponseCode() !== 200) {
     Logger.log('Claude API error: ' + res.getContentText());
+    LAST_AI_ERROR_ = { code: res.getResponseCode(), text: res.getContentText().slice(0, 500) };
     return null;
   }
 
@@ -979,14 +1099,15 @@ function parseImageWithClaude_(base64Data, mimeType, categories) {
     '1. ถ้าชื่อร้าน/รายละเอียดในสลิปสื่อถึงอาหารหรือร้านอาหารชัดเจน (มีคำว่า ร้าน, ครัว, เฮือน, ก๋วยเตี๋ยว, หมู, ไก่, ข้าว, ส้มตำ, อาหารตามสั่ง ฯลฯ) → หมวด "ค่ากิน"\n' +
     '2. ถ้าเป็นชื่อร้าน/แบรนด์ปั๊มน้ำมันชัดเจน เช่น PT, ปตท., PTT, บางจาก, เชลล์ (Shell), เอสโซ่ (Esso), คาลเท็กซ์ (Caltex), ซัสโก้ (Susco), หรือคำว่า "Max Card"/"แมกซ์ การ์ด" → หมวด "ค่าน้ำมัน" (สร้างหมวดนี้ถ้ายังไม่มี)\n' +
     '3. ถ้าเป็นการซื้อเครื่องดื่มโดยตรงเท่านั้น (มีคำว่า ชานม กาแฟ น้ำหวาน น้ำอัดลม สมูทตี้ ชัดเจน) → หมวด "ค่าน้ำ" — ห้ามใช้หมวดนี้เป็นค่าเริ่มต้นเวลาไม่แน่ใจ (หมวด "ค่าน้ำ" ไม่เกี่ยวกับค่าน้ำประปา ถ้าเป็นบิลน้ำประปา/ค่าน้ำมิเตอร์ ให้ใช้หมวด "ค่าน้ำประปา" แยกต่างหากแทน)\n' +
-    '4. ถ้าไม่เข้าเงื่อนไขข้างต้นเลย ให้เลือกหมวดที่ใกล้เคียงที่สุดจากลิสต์ที่มีอยู่ หรือตั้งชื่อหมวดใหม่สั้นๆที่ตรงความหมายที่สุด\n' +
+'4. ถ้าเป็นเครื่องสำอางหรือสกินแคร์ (ลิป ลิปสติก ทินท์ รองพื้น คุชชั่น แป้ง มาสคาร่า อายไลเนอร์ อายแชโดว์ บลัช คอนซีลเลอร์ ที่เขียนคิ้ว เซรั่ม โทนเนอร์ ครีมบำรุง มอยส์เจอไรเซอร์ ครีมกันแดด โฟม/คลีนซิ่งล้างหน้า มาส์กหน้า น้ำหอม) หรือซื้อจากร้านเครื่องสำอาง เช่น Eveandboy, Beautrium, Sephora, Konvy → หมวด "เครื่องสำอาง" เสมอ (สร้างหมวดนี้ถ้ายังไม่มี ห้ามใส่หมวด ของใช้)\n' +
+    '5. ถ้าไม่เข้าเงื่อนไขข้างต้นเลย ให้เลือกหมวดที่ใกล้เคียงที่สุดจากลิสต์ที่มีอยู่ หรือตั้งชื่อหมวดใหม่สั้นๆที่ตรงความหมายที่สุด\n' +
     'อ่านยอดเงินรวม (ยอดที่โอน/จ่ายจริง) จากรูป แล้วตอบกลับเป็น JSON เท่านั้น ห้ามมีคำอธิบายอื่นหรือ markdown fence รูปแบบ:\n' +
-    '{"type":"expense" หรือ "none","amount": ตัวเลขหรือ null,"category":"ชื่อหมวดที่ใกล้เคียงที่สุดจากลิสต์ หรือชื่อหมวดใหม่สั้นๆถ้าไม่มีหมวดไหนใกล้เคียง","shared": false,"currency":"รหัสสกุลเงิน ISO 3 ตัวอักษรตัวพิมพ์ใหญ่ตามที่ปรากฏในสลิป เช่น THB, JPY, USD, EUR, KRW (สังเกตจากสัญลักษณ์ ¥ $ € ₩ หรือชื่อสกุลเงินที่พิมพ์ไว้ ถ้าไม่ระบุเลยหรือเป็นสลิปธนาคารไทยปกติให้ใส่ THB ใส่ตัวเลข amount ตามสกุลเงินเดิมในสลิปตรงๆ ไม่ต้องคำนวณแปลงเอง)","note":"ชื่อร้าน/ผู้รับเงิน หรือรายละเอียดสั้นๆจากสลิปถ้ามี ไม่งั้นเป็นค่าว่าง","transactionDate":"วันที่ทำรายการตามที่ปรากฏในสลิป รูปแบบ YYYY-MM-DD (ถ้าปีในสลิปเป็น พ.ศ. ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อน เช่น สลิประบุ 9 ก.ย. 69 ให้ตอบ 2026-09-09) ถ้าอ่านวันที่จากสลิปไม่ได้เลยให้เป็นค่าว่าง"}\n' +
+    '{"type":"expense" หรือ "none","amount": ตัวเลขหรือ null,"category":"ชื่อหมวดที่ใกล้เคียงที่สุดจากลิสต์ หรือชื่อหมวดใหม่สั้นๆถ้าไม่มีหมวดไหนใกล้เคียง","shared": false,"currency":"รหัสสกุลเงิน ISO 3 ตัวอักษรตัวพิมพ์ใหญ่ตามที่ปรากฏในสลิป เช่น THB, JPY, USD, EUR, KRW (สังเกตจากสัญลักษณ์ ¥ $ € ₩ หรือชื่อสกุลเงินที่พิมพ์ไว้ ถ้าไม่ระบุเลยหรือเป็นสลิปธนาคารไทยปกติให้ใส่ THB ใส่ตัวเลข amount ตามสกุลเงินเดิมในสลิปตรงๆ ไม่ต้องคำนวณแปลงเอง)","note":"ชื่อร้าน/ผู้รับเงิน หรือรายละเอียดสั้นๆจากสลิปถ้ามี ไม่งั้นเป็นค่าว่าง","itemName":"ชื่อสินค้าสั้นๆ พร้อมยี่ห้อถ้ามี (ใส่เฉพาะเมื่อหมวดเป็น เครื่องสำอาง อ่านจากรายการสินค้าในใบเสร็จถ้ามี เช่น ลิป MAC Ruby Woo ไม่งั้นเป็นค่าว่าง)","transactionDate":"วันที่ทำรายการตามที่ปรากฏในสลิป รูปแบบ YYYY-MM-DD (ถ้าปีในสลิปเป็น พ.ศ. ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อน เช่น สลิประบุ 9 ก.ย. 69 ให้ตอบ 2026-09-09) ถ้าอ่านวันที่จากสลิปไม่ได้เลยให้เป็นค่าว่าง"}\n' +
     'ข้อสำคัญ: ให้ตอบ {"type":"none"} เฉพาะกรณีที่อ่าน "จำนวนเงิน" ในสลิปไม่ออกจริงๆ เท่านั้น (เช่น ภาพเบลอ/มืด/ไม่ใช่สลิปการเงิน) — ถ้าอ่านจำนวนเงินได้ชัดเจน ต้องตอบเป็น "expense" เสมอ ห้ามตอบ "none" เพียงเพราะไม่แน่ใจว่าเป็นหมวดอะไร (เช่น สลิปซื้อลอตเตอรี่ ค่าธรรมเนียม ค่าปรับ ของที่ไม่เข้าหมวดอาหาร/น้ำมัน/เครื่องดื่มเลย) ในกรณีแบบนี้ให้ใช้ข้อ 5 (ตั้งชื่อหมวดใหม่ที่ตรงความหมายที่สุด เช่น "หวย", "ค่าปรับ") แล้วบันทึกยอดเงินให้ถูกต้องเสมอ\n' +
     'ข้อบังคับที่สำคัญที่สุด: ตอบกลับด้วย JSON object เดียวเท่านั้นในคำตอบทั้งหมด ห้ามมีข้อความอื่นใดๆ ก่อนหรือหลัง JSON เด็ดขาด (ห้ามทักทาย ห้ามอธิบาย ห้ามขอโทษ ห้ามแก้ไขคำตอบตัวเองกลางข้อความ แม้จะสังเกตเห็นว่าตอบผิดไปแล้วก็ตาม) ให้คิดคำตอบให้รอบคอบและถูกต้องในใจก่อน แล้วค่อยพิมพ์ JSON ออกมาเพียงครั้งเดียวเท่านั้น';
 
   const payload = {
-    model: 'claude-sonnet-5',
+    model: 'claude-haiku-4-5-20251001',   // เดิมใช้ Sonnet: Haiku ถูกกว่ามากและอ่านสลิปธนาคารไทยได้ดีพอ
     max_tokens: 300,
     system: sys,
     messages: [{
@@ -1009,6 +1130,9 @@ function parseImageWithClaude_(base64Data, mimeType, categories) {
   if (res.getResponseCode() !== 200) {
     const errText = res.getContentText();
     Logger.log('Claude API (image) error: ' + errText);
+    LAST_AI_ERROR_ = { code: res.getResponseCode(), text: errText.slice(0, 500) };
+    const kind = aiErrorKind_(LAST_AI_ERROR_);
+    if (kind !== 'other') return { type: 'ai_error', kind: kind };
     return { type: 'debug_error', debug: 'HTTP ' + res.getResponseCode() + ': ' + errText.slice(0, 400) };
   }
 
@@ -1178,14 +1302,21 @@ function replyMonthlySummaryFlex_(replyToken, dateInMonth) {
 }
 
 // ---------- เลือกลบรายการของวันที่กำหนด (การ์ดมีปุ่มลบทีละรายการ) ----------
+// โฟกัสเห็นทุกรายการ, อ๋อมเห็นเฉพาะรายการของตัวเอง
 
-function showDeletePicker_(replyToken, dateStr) {
+function showDeletePicker_(replyToken, dateStr, senderUserId, props) {
   const data = getAllData_();
-  const list = data.expenses.filter(e => e.localDate === dateStr).sort((a, b) => a.id - b.id);
+  const isAdmin = isAdmin_(senderUserId, props);
+  const slot = resolveSenderSlot_(senderUserId, props);
+  const myName = slot ? props.getProperty(slot) : '';
+  const list = data.expenses
+    .filter(e => e.localDate === dateStr && canDeleteExpense_(e, senderUserId, props))
+    .sort((a, b) => a.id - b.id);
   const dateLabel = Number(dateStr.slice(8, 10)) + ' ' + monthLabelTh_(dateStr.slice(0, 7));
 
   if (list.length === 0) {
-    replyLine_(replyToken, `วันที่ ${dateLabel} ยังไม่มีรายการให้ลบค่ะ\n(พิมพ์ "ลบของเมื่อวาน" หรือ "ลบรายการวันที่ 3" เพื่อดูวันอื่นได้)`);
+    const whose = isAdmin ? '' : 'ของ' + myName;
+    replyLine_(replyToken, `วันที่ ${dateLabel} ยังไม่มีรายการ${whose}ให้ลบค่ะ\n(พิมพ์ "ลบของเมื่อวาน" หรือ "ลบรายการวันที่ 3" เพื่อดูวันอื่นได้)`);
     return;
   }
 
@@ -1224,41 +1355,52 @@ function showDeletePicker_(replyToken, dateStr) {
       header: {
         type: 'box', layout: 'vertical', backgroundColor: '#173C36', paddingAll: 'lg',
         contents: [
-          { type: 'text', text: 'เลือกรายการที่จะลบ', size: 'xs', color: '#D9BE6E' },
+          { type: 'text', text: isAdmin ? 'เลือกรายการที่จะลบ' : `เลือกรายการของ${myName}ที่จะลบ`, size: 'xs', color: '#D9BE6E' },
           { type: 'text', text: dateLabel, size: 'lg', weight: 'bold', color: '#FFFFFF' }
         ]
       },
-      body: { type: 'box', layout: 'vertical', paddingAll: 'lg', contents: rows }
+      body: { type: 'box', layout: 'vertical', paddingAll: 'lg', contents: rows },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: 'md',
+        contents: [{ type: 'button', height: 'sm', style: 'secondary', action: { type: 'message', label: 'ยกเลิก', text: 'ยกเลิก' } }]
+      }
     }
   };
 
   const ok = sendLineMessages_('reply', replyToken, [flex]);
   if (!ok) {
-    // ส่งการ์ดไม่ผ่าน: ส่งเป็นข้อความพร้อมวิธีลบแบบระบุลำดับย้อนหลังแทน
-    const sortedAll = [...data.expenses].sort((a, b) => b.id - a.id);
+    // ส่งการ์ดไม่ผ่าน: ส่งเป็นข้อความแทน
     const lines = [`รายการวันที่ ${dateLabel}:`];
-    shown.forEach(e => {
-      const pos = sortedAll.findIndex(x => x.id === e.id) + 1;
-      const whoLabel = e.who === WHO_SHARED ? 'ร่วมกัน' : e.who;
-      lines.push(`• ${e.category} ${fmtBaht_(e.amount)} (${whoLabel}) → พิมพ์ "ลบล่าสุด ${pos}"`);
-    });
+    if (isAdmin) {
+      const sortedAll = [...data.expenses].sort((a, b) => b.id - a.id);
+      shown.forEach(e => {
+        const pos = sortedAll.findIndex(x => x.id === e.id) + 1;
+        const whoLabel = e.who === WHO_SHARED ? 'ร่วมกัน' : e.who;
+        lines.push(`• ${e.category} ${fmtBaht_(e.amount)} (${whoLabel}) → พิมพ์ "ลบล่าสุด ${pos}"`);
+      });
+    } else {
+      shown.forEach(e => lines.push(`• ${e.category} ${fmtBaht_(e.amount)}`));
+      lines.push('(การ์ดแสดงไม่ได้ ลองพิมพ์ "ลบ" ใหม่อีกครั้ง หรือแจ้งโฟกัสให้ช่วยลบนะคะ)');
+    }
     replyLine_(replyToken, lines.join('\n'));
   }
 }
 
 function handlePostback_(ev, senderUserId, props) {
   const data = (ev.postback && ev.postback.data) || '';
+  if (data.indexOf('cos:') === 0) { handleCosmeticPostback_(ev, data, senderUserId, props); return; }
+  if (/^cat(new|x|clear)?:/.test(data)) { handleCategoryPostback_(ev, data, senderUserId, props); return; }
   if (data.indexOf('del:') !== 0) return;
-
-  if (!isAdmin_(senderUserId, props)) {
-    replyLine_(ev.replyToken, 'คำสั่งแก้ไข/ลบ/ตั้งค่า ใช้ได้เฉพาะผู้ดูแลระบบค่ะ');
-    return;
-  }
 
   const id = data.slice(4);
   const target = getAllData_().expenses.find(e => String(e.id) === String(id));
   if (!target) {
     replyLine_(ev.replyToken, 'รายการนี้ถูกลบไปแล้ว หรือไม่มีอยู่ในระบบค่ะ');
+    return;
+  }
+  // กันกดปุ่มลบรายการของอีกคน (เช่นกดจากการ์ดที่ส่งในกลุ่ม)
+  if (!canDeleteExpense_(target, senderUserId, props)) {
+    replyLine_(ev.replyToken, 'ลบได้เฉพาะรายการของตัวเองค่ะ ถ้าต้องการลบรายการนี้ แจ้งโฟกัสให้ช่วยลบนะคะ');
     return;
   }
   deleteExpense_(target.id);
@@ -1314,6 +1456,20 @@ function dailyLineSummary() {
   targets.forEach(id => pushLine_(token, id, text));
   // จำเวลาที่ส่งแจ้งเตือนครั้งนี้ไว้ เพื่อเช็คว่ารายการที่บันทึกหลังจากนี้เป็น "บันทึกหลังแจ้งเตือน" ของวันถัดไป
   props.setProperty('LAST_DAILY_NOTIFIED_AT', sendTime.toISOString());
+
+  // วันสุดท้ายของเดือน: เตือนยอดยืมเงินตัวเองที่ค้าง (ส่งเฉพาะผู้ดูแลระบบคนเดียว)
+  try {
+    selfLoanMonthEndReminder_(false);
+  } catch (e) {
+    Logger.log('selfLoanMonthEndReminder_ error: ' + e);
+  }
+
+  // เครื่องสำอาง: เตือนใกล้หมดอายุ / น่าจะใกล้หมด (ส่งเฉพาะเจ้าของ)
+  try {
+    cosmeticsDailyCheck_();
+  } catch (e) {
+    Logger.log('cosmeticsDailyCheck_ error: ' + e);
+  }
 }
 
 function buildDailySummaryText_(includeCatchup) {
@@ -1367,6 +1523,11 @@ function buildDailySummaryText_(includeCatchup) {
       }
     }
   }
+
+  pendingSummaryLines_().forEach(l => lines.push(l));
+
+  lines.push('');
+  lines.push('💾 ' + backupLabel_());
 
   return lines.join('\n');
 }
@@ -1433,6 +1594,1240 @@ function buildMonthlySummaryText_(dateInMonth) {
   return lines.join('\n');
 }
 
+// ---------- สำรองข้อมูล (Backup) ----------
+// ส่งออกทั้งชีตเป็นไฟล์ Excel (.xlsx) เก็บในโฟลเดอร์ Google Drive แยกต่างหาก
+// เป็นไฟล์ข้อมูลล้วน ไม่มีโค้ดหรือรหัสลับติดไปด้วย เปิดดูได้ทั้งใน Excel และ Google Sheets
+
+const BACKUP_FOLDER_NAME = 'สำรองข้อมูล - บันทึกรายจ่ายคู่รัก';
+const BACKUP_KEEP = 8;           // เก็บไฟล์สำรองล่าสุดกี่ชุด (สัปดาห์ละชุด = ย้อนหลังราว 2 เดือน เก่ากว่านี้ย้ายลงถังขยะ)
+const BACKUP_PREFIX = 'backup-รายจ่าย-';
+
+function getBackupFolder_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('BACKUP_FOLDER_ID');
+  if (id) {
+    try {
+      const f = DriveApp.getFolderById(id);
+      if (!f.isTrashed()) return f;
+    } catch (e) {
+      // โฟลเดอร์ถูกลบไปแล้ว สร้างใหม่ด้านล่าง
+    }
+  }
+  const it = DriveApp.getFoldersByName(BACKUP_FOLDER_NAME);
+  const folder = it.hasNext() ? it.next() : DriveApp.createFolder(BACKUP_FOLDER_NAME);
+  props.setProperty('BACKUP_FOLDER_ID', folder.getId());
+  return folder;
+}
+
+// ลายนิ้วมือของข้อมูล ใช้เช็คว่ามีอะไรเปลี่ยนตั้งแต่สำรองครั้งก่อนไหม
+function dataFingerprint_() {
+  const { expenses, categories } = ensureSheets_();
+  const raw = JSON.stringify(expenses.getDataRange().getValues()) + '|' + JSON.stringify(categories.getDataRange().getValues());
+  return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, raw, Utilities.Charset.UTF_8));
+}
+
+// สำรองข้อมูลทันที คืนค่า { url, rows, name, skipped } (โยน error ถ้าไม่สำเร็จ)
+// onlyIfChanged = true → ถ้าข้อมูลไม่เปลี่ยนตั้งแต่ครั้งก่อน จะไม่สร้างไฟล์ใหม่ (ใช้กับรอบอัตโนมัติ)
+function backupNow_(onlyIfChanged) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const { ss, expenses } = ensureSheets_();
+    SpreadsheetApp.flush();
+    const fp = dataFingerprint_();
+    const props = PropertiesService.getScriptProperties();
+    if (onlyIfChanged && fp === props.getProperty('LAST_BACKUP_HASH')) {
+      return { skipped: true, rows: Math.max(expenses.getLastRow() - 1, 0) };
+    }
+    const res = UrlFetchApp.fetch(
+      'https://docs.google.com/spreadsheets/d/' + ss.getId() + '/export?format=xlsx',
+      { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) {
+      throw new Error('ส่งออกไฟล์ไม่สำเร็จ (HTTP ' + res.getResponseCode() + ')');
+    }
+    const now = new Date();
+    const name = BACKUP_PREFIX + Utilities.formatDate(now, getActiveTimezone_(), 'yyyy-MM-dd_HHmm') + '.xlsx';
+    const folder = getBackupFolder_();
+    const file = folder.createFile(res.getBlob().setName(name));
+    const rows = Math.max(expenses.getLastRow() - 1, 0);
+
+    pruneOldBackups_(folder);
+
+    props.setProperty('LAST_BACKUP_AT', now.toISOString());
+    props.setProperty('LAST_BACKUP_HASH', fp);
+    props.setProperty('LAST_BACKUP_INFO', JSON.stringify({ url: file.getUrl(), rows: rows, name: name }));
+    writeBackupStatusToDashboard_();
+    return { url: file.getUrl(), rows: rows, name: name };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function pruneOldBackups_(folder) {
+  const files = [];
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    if (f.getName().indexOf(BACKUP_PREFIX) === 0) files.push(f);
+  }
+  files.sort((a, b) => b.getDateCreated() - a.getDateCreated());
+  files.slice(BACKUP_KEEP).forEach(f => f.setTrashed(true));
+}
+
+function getBackupStatus_() {
+  const props = PropertiesService.getScriptProperties();
+  const at = props.getProperty('LAST_BACKUP_AT');
+  let info = {};
+  try { info = JSON.parse(props.getProperty('LAST_BACKUP_INFO') || '{}'); } catch (e) { info = {}; }
+  return { at: at || '', label: backupLabel_(), url: info.url || '', rows: info.rows || 0 };
+}
+
+// ข้อความสถานะ เช่น "สำรองข้อมูลแล้ว: 6 ต.ค. 2026 03:00 (42 รายการ)"
+function backupLabel_() {
+  const props = PropertiesService.getScriptProperties();
+  const at = props.getProperty('LAST_BACKUP_AT');
+  if (!at) return 'ยังไม่เคยสำรองข้อมูล';
+  let rows = '';
+  try {
+    const info = JSON.parse(props.getProperty('LAST_BACKUP_INFO') || '{}');
+    if (info.rows !== undefined) rows = ` (${info.rows} รายการ)`;
+  } catch (e) {}
+  const d = new Date(at);
+  const label = Number(Utilities.formatDate(d, getActiveTimezone_(), 'd')) + ' ' +
+    TH_MONTHS_SHORT_[Number(Utilities.formatDate(d, getActiveTimezone_(), 'M')) - 1] + ' ' +
+    Utilities.formatDate(d, getActiveTimezone_(), 'yyyy HH:mm');
+  return 'สำรองข้อมูลแล้ว: ' + label + rows;
+}
+
+const TH_MONTHS_SHORT_ = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+
+// แสดงสถานะสำรองข้อมูลมุมขวาบนของแท็บ Dashboard ด้วย
+function writeBackupStatusToDashboard_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Dashboard');
+  if (!sheet) return;
+  sheet.getRange('D4').setValue('💾 ' + backupLabel_())
+    .setFontSize(9).setFontColor('#6B6A5E').setVerticalAlignment('middle');
+}
+
+/** ทริกเกอร์สำรองข้อมูลอัตโนมัติทุกวันอาทิตย์ (ข้ามถ้าข้อมูลไม่เปลี่ยน) ถ้าไม่สำเร็จจะแจ้งโฟกัสทาง LINE */
+function dailyBackup() {
+  try {
+    const r = backupNow_(true);
+    if (r.skipped) { Logger.log('ข้อมูลไม่เปลี่ยนตั้งแต่สำรองครั้งก่อน ไม่ต้องสร้างไฟล์ใหม่'); return; }
+    Logger.log('สำรองข้อมูลเรียบร้อย: ' + r.name + ' (' + r.rows + ' รายการ) ' + r.url);
+  } catch (e) {
+    Logger.log('สำรองข้อมูลไม่สำเร็จ: ' + e);
+    const props = PropertiesService.getScriptProperties();
+    const token = props.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+    const adminId = props.getProperty('ADMIN_LINE_ID') || props.getProperty('PARTNER1_LINE_ID');
+    if (token && adminId) pushLine_(token, adminId, '⚠️ สำรองข้อมูลอัตโนมัติไม่สำเร็จ\n' + e + '\nลองพิมพ์ "สำรองข้อมูล" เพื่อสั่งใหม่ได้ค่ะ');
+  }
+}
+
+/** รันครั้งเดียวจาก Editor: ตั้งเวลาสำรองข้อมูลทุกวันอาทิตย์ 03:00 แล้วสำรองทันที 1 ชุด และย้ายไฟล์เก่าเกิน BACKUP_KEEP ชุดลงถังขยะ */
+function setupBackupTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'dailyBackup') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('dailyBackup')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.SUNDAY)
+    .atHour(3)
+    .create();
+  const r = backupNow_();
+  Logger.log('ตั้งเวลาสำรองข้อมูลทุกวันอาทิตย์ 03:00 เรียบร้อย และสำรองครั้งแรกแล้ว: ' + r.name + ' (' + r.rows + ' รายการ)');
+  Logger.log('เปิดไฟล์: ' + r.url);
+}
+
+// ---------- ยืมเงินตัวเอง (ส่วนตัว เห็นเฉพาะผู้ดูแลระบบ) ----------
+// เก็บแยกในแท็บ SelfLoans ไม่ปนกับ Expenses จึงไม่โผล่ในสรุปรายวัน/รายเดือน การค้นหา หรือ Dashboard
+// ใช้ได้เฉพาะในแชทส่วนตัว 1:1 กับบอท ถ้าพิมพ์ในกลุ่ม บอทจะไม่ตอบในกลุ่มและไม่บันทึก
+//   "ยืมเงินตัวเอง 2000 ซื้อของให้แฟน"   → บันทึกยอดยืม
+//   "คืนเงินตัวเอง 500"                  → บันทึกการคืน (หักจากรายการที่ยืมเก่าสุดก่อน)
+//   "ยอดยืม"                             → ดูยอดค้าง
+//   "ลบยืมล่าสุด"                         → ลบรายการยืม/คืนล่าสุดที่บันทึกผิด
+
+const SHEET_SELFLOANS = 'SelfLoans';
+
+function getSelfLoanSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_SELFLOANS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_SELFLOANS);
+    sh.appendRow(['ID', 'LocalDate', 'Type', 'Amount', 'Note', 'RecordedAt']);
+    sh.getRange(1, 2, sh.getMaxRows(), 1).setNumberFormat('@');
+    sh.getRange(1, 6, sh.getMaxRows(), 1).setNumberFormat('@');
+  }
+  return sh;
+}
+
+function getSelfLoans_() {
+  return getSelfLoanSheet_().getDataRange().getValues().slice(1)
+    .filter(r => r[0])
+    .map(r => ({
+      id: r[0],
+      localDate: r[1] instanceof Date ? Utilities.formatDate(r[1], getActiveTimezone_(), 'yyyy-MM-dd') : String(r[1]),
+      type: r[2],                       // 'borrow' หรือ 'repay'
+      amount: Number(r[3]) || 0,
+      note: r[4] || ''
+    }));
+}
+
+// คำนวณยอดค้าง: เอายอดคืนทั้งหมดไปหักรายการยืมที่เก่าที่สุดก่อน
+function selfLoanStatus_() {
+  const all = getSelfLoans_().sort((a, b) => a.localDate.localeCompare(b.localDate) || a.id - b.id);
+  const borrows = all.filter(x => x.type === 'borrow');
+  let repaid = all.filter(x => x.type === 'repay').reduce((s, x) => s + x.amount, 0);
+  const totalBorrowed = borrows.reduce((s, x) => s + x.amount, 0);
+  const totalRepaid = repaid;
+  const open = [];
+  borrows.forEach(b => {
+    const used = Math.min(repaid, b.amount);
+    repaid -= used;
+    const left = Math.round((b.amount - used) * 100) / 100;
+    if (left > 0) open.push({ localDate: b.localDate, amount: b.amount, left: left, note: b.note });
+  });
+  const outstanding = Math.round((totalBorrowed - totalRepaid) * 100) / 100;
+  // สรุปเฉพาะเดือนนี้ (ตามเขตเวลาที่ใช้งานอยู่)
+  const monthKey = localDatePrefix_(new Date(), 'yyyy-MM');
+  const inMonth = all.filter(x => (x.localDate || '').slice(0, 7) === monthKey);
+  const monthBorrowed = inMonth.filter(x => x.type === 'borrow').reduce((s, x) => s + x.amount, 0);
+  const monthBorrowCount = inMonth.filter(x => x.type === 'borrow').length;
+  const monthRepaid = inMonth.filter(x => x.type === 'repay').reduce((s, x) => s + x.amount, 0);
+  return { outstanding: outstanding, open: open, totalBorrowed: totalBorrowed, totalRepaid: totalRepaid,
+    monthKey: monthKey, monthBorrowed: monthBorrowed, monthBorrowCount: monthBorrowCount, monthRepaid: monthRepaid };
+}
+
+function shortThDate_(yyyyMMdd) {
+  const p = yyyyMMdd.split('-');
+  return Number(p[2]) + ' ' + TH_MONTHS_SHORT_[Number(p[1]) - 1];
+}
+
+function selfLoanMonthLine_(st) {
+  return `เดือน${monthLabelTh_(st.monthKey)}: ยืมไป ${fmtBaht_(st.monthBorrowed)} บาท (${st.monthBorrowCount} ครั้ง) · คืนแล้ว ${fmtBaht_(st.monthRepaid)} บาท`;
+}
+
+function selfLoanStatusText_(st) {
+  if (st.outstanding <= 0) {
+    return st.outstanding < 0
+      ? `ไม่มียอดค้างค่ะ (คืนเกินไป ${fmtBaht_(-st.outstanding)} บาท)`
+      : 'ไม่มียอดยืมเงินตัวเองค้างแล้วค่ะ 🎉';
+  }
+  const lines = [`ยอดค้างคืนทั้งหมด: ${fmtBaht_(st.outstanding)} บาท`];
+  st.open.forEach(o => {
+    const part = o.left < o.amount ? ` (เหลือ ${fmtBaht_(o.left)})` : '';
+    lines.push(`• ${shortThDate_(o.localDate)} ยืม ${fmtBaht_(o.amount)}${part}${o.note ? ' · ' + o.note : ''}`);
+  });
+  return lines.join('\n');
+}
+
+// คืนค่า true ถ้าข้อความนี้เป็นคำสั่งยืมเงินตัวเอง (จัดการไปแล้ว ไม่ต้องทำต่อ)
+function handleSelfLoanMessage_(ev, text, senderUserId, props) {
+  const compact = text.replace(/\s+/g, '');
+  let kind = null;
+  // ประโยคคำถาม (เช่น "เดือนนี้ยืมเงินตัวเองไปเท่าไหร่") ต้องเช็คก่อน ไม่งั้นจะโดนจับเป็นคำสั่งยืม
+  if (/(เท่าไหร่|เท่าไร|กี่บาท|เท่าไหร|ไปแล้ว\?|\?)$/.test(compact) && /ย[ืิึี]ม/.test(compact) && /ตัวเอง/.test(compact)) kind = 'status';
+  else if (/^(วันนี้)?(ขอ)?ย[ืิึี]ม(เงิน|งิน)?ตัวเอง/.test(compact)) kind = 'borrow';   // รองรับพิมพ์ผิด ยิม/ยึม/ยีม
+  else if (/^(วันนี้)?ค[ืิึี]น(เงิน|งิน)?(ให้)?ตัวเอง/.test(compact)) kind = 'repay';
+  else if (/^(ดู|เช็ค|เช็ก)?ยอดย[ืิึี]ม(เงิน)?(ตัวเอง)?(เดือนนี้)?$/.test(compact) ||
+           /^(เดือนนี้)?ย[ืิึี]ม(เงิน)?ตัวเอง(ไป)?(เท่าไหร่|เท่าไร|กี่บาท)/.test(compact)) kind = 'status';
+  else if (/^(ลบ|ยกเลิก)(รายการ)?ย[ืิึี]ม(เงินตัวเอง)?ล่าสุด$/.test(compact)) kind = 'undo';
+  if (!kind) return false;
+
+  // คนอื่นพิมพ์ ปล่อยผ่านไปทำงานตามปกติ ไม่บอกใบ้ว่ามีฟังก์ชันนี้
+  if (!isAdmin_(senderUserId, props)) return false;
+
+  const src = ev.source || {};
+  if (src.groupId || src.roomId) {
+    // ห้ามตอบในกลุ่ม: แจ้งเตือนแยกเข้าแชทส่วนตัวแทน และไม่บันทึก
+    const token = props.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+    if (token && senderUserId) {
+      pushLine_(token, senderUserId,
+        '🔒 คำสั่ง "ยืมเงินตัวเอง" พิมพ์ในกลุ่มอยู่ค่ะ น้องต้มยำเลยไม่ตอบในกลุ่มและยังไม่ได้บันทึกให้\n\n' +
+        'พิมพ์ใหม่ในแชทนี้ (แชทส่วนตัว) แทนนะคะ\n' +
+        'ข้อความในกลุ่มกด "ยกเลิกส่ง" ได้ภายใน 24 ชม. (กดค้างที่ข้อความ → ยกเลิกส่ง)');
+    }
+    return true;
+  }
+
+  const sh = getSelfLoanSheet_();
+  const today = localDatePrefix_(new Date(), 'yyyy-MM-dd');
+
+  if (kind === 'status') {
+    const st0 = selfLoanStatus_();
+    replyLine_(ev.replyToken, '🔒 ยืมเงินตัวเอง (เห็นคนเดียว)\n' + selfLoanMonthLine_(st0) + '\n\n' + selfLoanStatusText_(st0) +
+      '\n\nพิมพ์ "คืนเงินตัวเอง 500" เมื่อคืนเงิน');
+    return true;
+  }
+
+  if (kind === 'undo') {
+    const last = sh.getLastRow();
+    if (last < 2) { replyLine_(ev.replyToken, 'ยังไม่มีรายการยืมเงินตัวเองให้ลบค่ะ'); return true; }
+    const row = sh.getRange(last, 1, 1, 5).getValues()[0];
+    sh.deleteRow(last);
+    replyLine_(ev.replyToken,
+      `🔒 ลบแล้วค่ะ ✅\n${row[2] === 'borrow' ? 'ยืม' : 'คืน'} ${fmtBaht_(row[3])} บาท${row[4] ? ' · ' + row[4] : ''}\n\n` +
+      selfLoanStatusText_(selfLoanStatus_()));
+    return true;
+  }
+
+  const m = text.match(/(\d[\d,]*(?:\.\d+)?)/);
+  const amount = m ? Number(m[1].replace(/,/g, '')) : 0;
+  if (!amount || amount <= 0) {
+    replyLine_(ev.replyToken, kind === 'borrow'
+      ? 'ใส่จำนวนเงินด้วยค่ะ เช่น "ยืมเงินตัวเอง 2000 ซื้อของให้แฟน"'
+      : 'ใส่จำนวนเงินด้วยค่ะ เช่น "คืนเงินตัวเอง 500"');
+    return true;
+  }
+  const note = text
+    .replace(m[1], ' ')
+    .replace(/^\s*(วันนี้\s*)?(ขอ\s*)?(ย[ืิึี]ม\s*(เงิน|งิน)?\s*ตัวเอง|ค[ืิึี]น\s*(เงิน|งิน)?\s*(ให้\s*)?ตัวเอง)/, ' ')
+    .replace(/(^|\s)บาท(?=\s|$)/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+
+  sh.appendRow([Date.now(), today, kind, amount, note, new Date().toISOString()]);
+  const st = selfLoanStatus_();
+  const head = kind === 'borrow'
+    ? `🔒 บันทึกยืมเงินตัวเองแล้วค่ะ ✅\n-${fmtBaht_(amount)} บาท${note ? ' · ' + note : ''}`
+    : `🔒 บันทึกคืนเงินตัวเองแล้วค่ะ ✅\n+${fmtBaht_(amount)} บาท${note ? ' · ' + note : ''}`;
+  replyLine_(ev.replyToken, head + '\n\n' + selfLoanStatusText_(st) +
+    (kind === 'borrow' ? '\n\n(ไม่นับเป็นรายจ่ายร่วม และไม่ขึ้นในสรุปที่ส่งให้อีกฝ่าย จะเตือนเฉพาะคุณทุกสิ้นเดือน)' : ''));
+  return true;
+}
+
+// เรียกจาก dailyLineSummary ทุกวัน 20:00 แต่จะส่งจริงเฉพาะวันสุดท้ายของเดือน และมียอดค้าง
+function selfLoanMonthEndReminder_(force) {
+  const props = PropertiesService.getScriptProperties();
+  const now = new Date();
+  const isLastDay = localDatePrefix_(new Date(now.getTime() + 86400000), 'dd') === '01';
+  if (!force && !isLastDay) return;
+
+  const st = selfLoanStatus_();
+  if (!force && st.outstanding <= 0) return;
+
+  const token = props.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  const adminId = props.getProperty('ADMIN_LINE_ID') || props.getProperty('PARTNER1_LINE_ID');
+  if (!token || !adminId) return;
+
+  pushLine_(token, adminId,
+    `🔒 เตือนสิ้นเดือน: ยืมเงินตัวเอง (เห็นคนเดียว)\n${selfLoanMonthLine_(st)}\n\n` +
+    selfLoanStatusText_(st) +
+    '\n\nคืนแล้วพิมพ์ "คืนเงินตัวเอง 500" ในแชทนี้ได้เลยค่ะ');
+}
+
+/** ทดสอบ: ส่งเตือนยอดยืมเงินตัวเองเข้า LINE ของผู้ดูแลระบบทันที (ไม่ต้องรอสิ้นเดือน) */
+function testSelfLoanReminder() {
+  selfLoanMonthEndReminder_(true);
+}
+
+// ---------- เครื่องสำอาง (ของอ๋อม) ----------
+// แท็บ Cosmetics เก็บคลังของที่มี: ซื้อเมื่อไหร่ เปิดใช้เมื่อไหร่ หมดอายุเมื่อไหร่ ใช้หมดในกี่วัน
+// รายจ่ายยังอยู่ใน Expenses ตามปกติ (หมวด "เครื่องสำอาง") สรุปยอดจึงตรงกับระบบเดิม
+// เจ้าของคลัง = PARTNER2 (อ๋อม) เท่านั้น: ถ้าโฟกัสบันทึกหมวดเครื่องสำอาง (เช่นซื้อเป็นของขวัญ) จะไม่เข้าคลังและไม่มีเตือนไปหาอ๋อม
+
+const COSMETIC_CATEGORY = 'เครื่องสำอาง';
+const SHEET_COSMETICS = 'Cosmetics';
+const COSMETIC_HEADERS = ['ID', 'Name', 'Type', 'Price', 'BoughtDate', 'OpenedDate', 'PAOMonths', 'PrintedExpiry', 'CycleDays', 'Status', 'FinishedDate', 'ActualDays', 'Flags'];
+const COSMETIC_EXPIRY_WARN_DAYS = 30;   // เตือนก่อนหมดอายุกี่วัน
+const COSMETIC_RUNOUT_WARN_DAYS = 7;    // เตือนก่อนน่าจะใช้หมดกี่วัน
+const COSMETIC_SNOOZE_DAYS = 14;        // กด "ยังเหลือ" แล้วเลื่อนเตือนไปกี่วัน
+
+// อายุหลังเปิด (PAO, เดือน) และรอบใช้หมดโดยประมาณ (วัน) ตามประเภท เรียงจากคำที่เจาะจงก่อน
+const COSMETIC_TYPES_ = [
+  { type: 'ครีมกันแดด', kw: ['กันแดด', 'sunscreen', 'spf', 'sunblock'], pao: 12, cycle: 60 },
+  { type: 'มาสคาร่า', kw: ['มาสคาร่า', 'mascara'], pao: 6, cycle: 90 },
+  { type: 'อายไลเนอร์', kw: ['อายไลเนอร์', 'ไลเนอร์', 'eyeliner', 'liner'], pao: 6, cycle: 90 },
+  { type: 'คิ้ว', kw: ['คิ้ว', 'brow'], pao: 12, cycle: 120 },
+  { type: 'รองพื้น/คุชชั่น', kw: ['รองพื้น', 'foundation', 'คุชชั่น', 'cushion', 'บีบี', 'bb cream', 'cc cream'], pao: 12, cycle: 90 },
+  { type: 'คอนซีลเลอร์', kw: ['คอนซีล', 'concealer'], pao: 12, cycle: 120 },
+  { type: 'ลิป', kw: ['ลิป', 'lip', 'ทินท์', 'tint'], pao: 18, cycle: 150 },
+  { type: 'แป้ง', kw: ['แป้ง', 'powder'], pao: 24, cycle: 150 },
+  { type: 'อายแชโดว์/บลัช', kw: ['อายแชโดว์', 'eyeshadow', 'บลัช', 'blush', 'ปัดแก้ม', 'ไฮไลท์', 'highlight', 'คอนทัวร์', 'contour'], pao: 24, cycle: 240 },
+  { type: 'คลีนเซอร์', kw: ['คลีนซิ่ง', 'cleansing', 'ล้างหน้า', 'โฟม', 'cleanser', 'ไมเซล่า', 'micellar', 'ล้างเครื่องสำอาง'], pao: 12, cycle: 60 },
+  { type: 'มาส์ก', kw: ['มาส์ก', 'มาร์ก', 'mask'], pao: 12, cycle: 30 },
+  { type: 'โทนเนอร์', kw: ['โทนเนอร์', 'toner'], pao: 12, cycle: 75 },
+  { type: 'เซรั่ม', kw: ['เซรั่ม', 'serum', 'แอมพูล', 'ampoule', 'essence', 'เอสเซนส์'], pao: 12, cycle: 60 },
+  { type: 'ครีมบำรุง', kw: ['มอยส์', 'moistur', 'ครีม', 'cream', 'เจล', 'gel', 'โลชั่น', 'lotion'], pao: 12, cycle: 60 },
+  { type: 'น้ำหอม', kw: ['น้ำหอม', 'perfume', 'parfum', 'cologne', 'edt', 'edp'], pao: 36, cycle: 240 }
+];
+const COSMETIC_DEFAULT_TYPE_ = { type: 'อื่นๆ', pao: 12, cycle: 90 };
+
+function cosmeticOwnerName_(props) {
+  return (props || PropertiesService.getScriptProperties()).getProperty('PARTNER2') || 'คนที่ 2';
+}
+
+function getCosmeticSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_COSMETICS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_COSMETICS);
+    sh.appendRow(COSMETIC_HEADERS);
+    // คอลัมน์วันที่เก็บเป็นข้อความล้วน กัน Sheets แปลงเป็น Date object เอง
+    [5, 6, 8, 11].forEach(c => sh.getRange(1, c, sh.getMaxRows(), 1).setNumberFormat('@'));
+  }
+  return sh;
+}
+
+function cosDateStr_(v) {
+  if (!v) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, getActiveTimezone_(), 'yyyy-MM-dd');
+  return String(v);
+}
+
+function getCosmetics_() {
+  return getCosmeticSheet_().getDataRange().getValues().slice(1)
+    .map((r, i) => ({ row: i + 2, r: r }))
+    .filter(x => x.r[0])
+    .map(x => {
+      let flags = {};
+      try { flags = JSON.parse(x.r[12] || '{}'); } catch (e) { flags = {}; }
+      return {
+        row: x.row, id: x.r[0], name: String(x.r[1] || ''), type: String(x.r[2] || ''), price: Number(x.r[3]) || 0,
+        bought: cosDateStr_(x.r[4]), opened: cosDateStr_(x.r[5]), pao: Number(x.r[6]) || 0,
+        printedExpiry: cosDateStr_(x.r[7]), cycle: Number(x.r[8]) || 0, status: String(x.r[9] || 'active'),
+        finished: cosDateStr_(x.r[10]), actualDays: Number(x.r[11]) || 0, flags: flags
+      };
+    });
+}
+
+function saveCosmetic_(it) {
+  getCosmeticSheet_().getRange(it.row, 1, 1, COSMETIC_HEADERS.length).setValues([[
+    it.id, it.name, it.type, it.price, it.bought, it.opened, it.pao, it.printedExpiry, it.cycle,
+    it.status, it.finished, it.actualDays, JSON.stringify(it.flags || {})
+  ]]);
+}
+
+// ---- วันที่ (ทำงานกับข้อความ yyyy-MM-dd ล้วน) ----
+function cosToday_() { return localDatePrefix_(new Date(), 'yyyy-MM-dd'); }
+function cosDayNum_(s) { const p = s.split('-').map(Number); return Date.UTC(p[0], p[1] - 1, p[2]) / 86400000; }
+function cosDaysBetween_(a, b) { return Math.round(cosDayNum_(b) - cosDayNum_(a)); }
+function cosAddDays_(s, n) { return new Date((cosDayNum_(s) + n) * 86400000).toISOString().slice(0, 10); }
+function cosAddMonths_(s, n) {
+  const p = s.split('-').map(Number);
+  const last = new Date(Date.UTC(p[0], p[1] - 1 + n + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(p[0], p[1] - 1 + n, Math.min(p[2], last))).toISOString().slice(0, 10);
+}
+function cosThDate_(s) {
+  if (!s) return '-';
+  const p = s.split('-');
+  const y = Number(p[0]);
+  const curY = Number(cosToday_().slice(0, 4));
+  return Number(p[2]) + ' ' + TH_MONTHS_SHORT_[Number(p[1]) - 1] + (y !== curY ? ' ' + String(y).slice(2) : '');
+}
+
+function cosNorm_(s) { return String(s || '').toLowerCase().replace(/\s+/g, ''); }
+
+function detectCosmeticType_(name) {
+  const n = cosNorm_(name);
+  for (let i = 0; i < COSMETIC_TYPES_.length; i++) {
+    const t = COSMETIC_TYPES_[i];
+    if (t.kw.some(k => n.indexOf(cosNorm_(k)) !== -1)) return t;
+  }
+  return COSMETIC_DEFAULT_TYPE_;
+}
+
+// รอบใช้หมด: เรียนรู้จากของชิ้นเดิมที่เคยใช้หมด > ประเภทเดียวกัน > ค่าเริ่มต้นของประเภท
+function estimateCycleDays_(name, typeInfo, all) {
+  const done = all.filter(x => x.status === 'finished' && x.actualDays > 0);
+  const avg = list => Math.round(list.reduce((s, x) => s + x.actualDays, 0) / list.length);
+  const same = done.filter(x => cosNorm_(x.name) === cosNorm_(name));
+  if (same.length) return { days: avg(same), source: 'same' };
+  const sameType = done.filter(x => x.type === typeInfo.type);
+  if (sameType.length) return { days: avg(sameType), source: 'type' };
+  return { days: typeInfo.cycle, source: 'default' };
+}
+
+function cosExpiry_(it) {
+  const byPao = it.opened && it.pao ? cosAddMonths_(it.opened, it.pao) : '';
+  const cands = [byPao, it.printedExpiry].filter(Boolean).sort();
+  return cands.length ? cands[0] : '';
+}
+function cosRunOut_(it) { return it.opened && it.cycle ? cosAddDays_(it.opened, it.cycle) : ''; }
+
+function addCosmeticItem_(name, price, boughtDate, opened, printedExpiry) {
+  const all = getCosmetics_();
+  const t = detectCosmeticType_(name);
+  const est = estimateCycleDays_(name, t, all);
+  const sh = getCosmeticSheet_();
+  // ID ต้องไม่ซ้ำ (ปุ่มกดอ้างถึงของด้วย ID) จึงใช้ค่าที่มากกว่า ID เดิมทุกตัวเสมอ
+  const id = Math.max(Date.now(), all.reduce((mx, x) => Math.max(mx, Number(x.id) || 0), 0) + 1);
+  sh.appendRow([id, name, t.type, price || 0, boughtDate, opened ? boughtDate : '', t.pao, printedExpiry || '', est.days, 'active', '', '', '{}']);
+  const item = getCosmetics_().find(x => String(x.id) === String(id));
+  // ซื้อชิ้นใหม่ของเดิม: ชิ้นเก่าที่ยังอยู่ในคลังไม่ต้องเตือนให้ซื้อซ้ำอีก
+  all.filter(x => x.status === 'active' && cosNorm_(x.name) === cosNorm_(name)).forEach(x => {
+    x.flags.runout = true; saveCosmetic_(x);
+  });
+  const prev = all.filter(x => cosNorm_(x.name) === cosNorm_(name) && x.price > 0)
+    .sort((a, b) => (b.bought || '').localeCompare(a.bought || ''))[0];
+  return { item: item, est: est, prev: prev };
+}
+
+function cosmeticMonthSpend_(owner, monthKey) {
+  return getAllData_().expenses
+    .filter(e => e.category === COSMETIC_CATEGORY && e.who === owner && (e.localDate || '').slice(0, 7) === monthKey);
+}
+
+function cosmeticBudgetLine_(owner, monthKey, props) {
+  const budget = Number((props || PropertiesService.getScriptProperties()).getProperty('COSMETIC_BUDGET')) || 0;
+  const spent = cosmeticMonthSpend_(owner, monthKey).reduce((s, e) => s + e.amount, 0);
+  if (!budget) return { text: `เดือนนี้ใช้เครื่องสำอางไป ${fmtBaht_(spent)} บาท`, spent: spent, budget: 0 };
+  const pct = Math.round(spent / budget * 100);
+  let icon = '🟢';
+  if (pct >= 100) icon = '🔴';
+  else if (pct >= 80) icon = '🟡';
+  const tail = spent > budget ? `เกินงบ ${fmtBaht_(spent - budget)} บาท` : `เหลือ ${fmtBaht_(budget - spent)} บาท`;
+  return { text: `${icon} งบเครื่องสำอางเดือนนี้: ${fmtBaht_(spent)} / ${fmtBaht_(budget)} บาท (${pct}%) · ${tail}`, spent: spent, budget: budget };
+}
+
+// เรียกหลังบันทึกรายจ่ายหมวดเครื่องสำอางของอ๋อม คืน { text, quick }
+function afterCosmeticPurchase_(parsed, amount, localDate, props) {
+  const owner = cosmeticOwnerName_(props);
+  const name = String(parsed.itemName || parsed.note || COSMETIC_CATEGORY).replace(/\s*\(.*?บาท\)\s*$/, '').trim().slice(0, 60);
+  const r = addCosmeticItem_(name, amount, localDate, true, '');
+  const it = r.item;
+  const lines = [];
+  lines.push(`💄 เพิ่มเข้าคลังแล้ว: ${it.name} (${it.type})`);
+  const exp = cosExpiry_(it);
+  if (exp) lines.push(`• เปิดแล้วใช้ได้ถึง ~${cosThDate_(exp)} (${it.pao} เดือนหลังเปิด)`);
+  const src = r.est.source === 'same' ? 'จากรอบที่แล้ว' : (r.est.source === 'type' ? 'จากของประเภทเดียวกัน' : 'ค่าประมาณ');
+  lines.push(`• น่าจะใช้หมดราว ${cosThDate_(cosRunOut_(it))} (~${it.cycle} วัน ${src})`);
+  if (r.prev) {
+    const diff = Math.round((amount - r.prev.price) * 100) / 100;
+    const cmp = diff === 0 ? 'ราคาเท่าเดิม' : (diff > 0 ? `แพงขึ้น ${fmtBaht_(diff)}` : `ถูกลง ${fmtBaht_(-diff)}`);
+    lines.push(`• ครั้งก่อน ${fmtBaht_(r.prev.price)} บาท (${cosThDate_(r.prev.bought)}) · ${cmp}`);
+  }
+  lines.push(cosmeticBudgetLine_(owner, localDate.slice(0, 7), props).text);
+  return {
+    text: '\n\n' + lines.join('\n'),
+    quick: [
+      { label: 'ยังไม่ได้เปิดใช้', data: 'cos:unopen:' + it.id, display: 'ยังไม่ได้เปิดใช้ ' + it.name },
+      { label: 'ใส่วันหมดอายุ', text: it.name + ' หมดอายุ ' }
+    ]
+  };
+}
+
+// ---- ข้อความ ----
+function withQuickReply_(msg, items) {
+  if (!items || !items.length) return msg;
+  msg.quickReply = {
+    items: items.slice(0, 13).map(q => ({
+      type: 'action',
+      action: q.data
+        ? { type: 'postback', label: q.label.slice(0, 20), data: q.data, displayText: (q.display || q.label).slice(0, 300) }
+        : { type: 'message', label: q.label.slice(0, 20), text: q.text }
+    }))
+  };
+  return msg;
+}
+
+function cosStatusOf_(it, today) {
+  const exp = cosExpiry_(it);
+  const run = cosRunOut_(it);
+  return {
+    exp: exp, run: run,
+    expLeft: exp ? cosDaysBetween_(today, exp) : null,
+    runLeft: run ? cosDaysBetween_(today, run) : null
+  };
+}
+
+function buildCosmeticListText_(owner) {
+  const today = cosToday_();
+  const items = getCosmetics_().filter(x => x.status === 'active');
+  if (!items.length) {
+    return `💄 คลังเครื่องสำอางของ${owner} ยังว่างอยู่ค่ะ\n\nซื้อของใหม่พิมพ์ตามปกติ เช่น "ลิป MAC 890" ระบบจะเพิ่มเข้าคลังให้เอง\nของที่มีอยู่แล้ว พิมพ์ "เพิ่มเครื่องสำอาง เซรั่ม Klairs" (ไม่นับเป็นรายจ่าย)`;
+  }
+  const rows = items.map(it => ({ it: it, st: cosStatusOf_(it, today) }));
+  const score = x => Math.min(x.st.expLeft === null ? 9999 : x.st.expLeft, x.st.runLeft === null ? 9999 : x.st.runLeft);
+  rows.sort((a, b) => score(a) - score(b));
+
+  const lines = [`💄 คลังเครื่องสำอางของ${owner} (${items.length} ชิ้น)`];
+  rows.forEach(({ it, st }) => {
+    let mark = '•';
+    if (st.expLeft !== null && st.expLeft <= 0) mark = '⚠️';
+    else if (st.expLeft !== null && st.expLeft <= COSMETIC_EXPIRY_WARN_DAYS) mark = '⏳';
+    else if (st.runLeft !== null && st.runLeft <= COSMETIC_RUNOUT_WARN_DAYS) mark = '🛒';
+    const parts = [];
+    parts.push(it.opened ? 'เปิด ' + cosThDate_(it.opened) : 'ยังไม่เปิด');
+    if (st.exp) parts.push(st.expLeft <= 0 ? 'หมดอายุแล้ว' : `หมดอายุ ${cosThDate_(st.exp)}${st.expLeft <= 60 ? ' (อีก ' + st.expLeft + ' วัน)' : ''}`);
+    if (st.run) parts.push(st.runLeft <= 0 ? 'น่าจะใกล้หมดแล้ว' : `น่าจะหมด ~${cosThDate_(st.run)}`);
+    lines.push(`${mark} ${it.name}\n   ${parts.join(' · ')}`);
+  });
+  lines.push('');
+  lines.push('⚠️ หมดอายุแล้ว · ⏳ ใกล้หมดอายุ · 🛒 น่าจะใกล้หมด');
+  lines.push('พิมพ์ "เปิดใช้ ชื่อ" · "ชื่อ หมดแล้ว" · "ทิ้ง ชื่อ"');
+  return lines.join('\n');
+}
+
+function buildCosmeticSummaryText_(owner, props) {
+  const monthKey = localDatePrefix_(new Date(), 'yyyy-MM');
+  const prevKey = prevMonthKey_(monthKey);
+  const cur = cosmeticMonthSpend_(owner, monthKey).sort((a, b) => (a.localDate || '').localeCompare(b.localDate || ''));
+  const prev = cosmeticMonthSpend_(owner, prevKey);
+  const sum = l => l.reduce((s, e) => s + e.amount, 0);
+  const ch = changeLabel_(sum(cur), sum(prev));
+
+  const lines = [`💄 เครื่องสำอางของ${owner} · ${monthLabelTh_(monthKey)}`];
+  lines.push(`ใช้ไป ${fmtBaht_(sum(cur))} บาท (${cur.length} รายการ)` + (sum(prev) ? ` · ${ch.text} จากเดือนก่อน (${fmtBaht_(sum(prev))})` : ''));
+  const b = cosmeticBudgetLine_(owner, monthKey, props);
+  if (b.budget) lines.push(b.text);
+  if (cur.length) {
+    lines.push('');
+    cur.slice(-15).forEach(e => lines.push(`• ${cosThDate_(e.localDate)} ${e.note ? e.note : COSMETIC_CATEGORY} ${fmtBaht_(e.amount)}`));
+  }
+
+  // ย้อนหลัง 6 เดือน
+  const all = getAllData_().expenses.filter(e => e.category === COSMETIC_CATEGORY && e.who === owner);
+  const months = [];
+  let k = monthKey;
+  for (let i = 0; i < 6; i++) { months.unshift(k); k = prevMonthKey_(k); }
+  const trend = months.map(m => {
+    const total = all.filter(e => (e.localDate || '').slice(0, 7) === m).reduce((s, e) => s + e.amount, 0);
+    return TH_MONTHS_SHORT_[Number(m.slice(5, 7)) - 1] + ' ' + fmtBaht_(total);
+  });
+  lines.push('');
+  lines.push('6 เดือนล่าสุด: ' + trend.join(' · '));
+
+  const today = cosToday_();
+  const active = getCosmetics_().filter(x => x.status === 'active').map(it => cosStatusOf_(it, today));
+  const nearExp = active.filter(x => x.expLeft !== null && x.expLeft <= COSMETIC_EXPIRY_WARN_DAYS).length;
+  const nearRun = active.filter(x => x.runLeft !== null && x.runLeft <= COSMETIC_RUNOUT_WARN_DAYS).length;
+  lines.push(`คลัง: ${active.length} ชิ้น · ใกล้/หมดอายุ ${nearExp} · น่าจะใกล้หมด ${nearRun} (พิมพ์ "เครื่องสำอาง" ดูรายละเอียด)`);
+  return lines.join('\n');
+}
+
+// ---- หาของจากชื่อที่พิมพ์ ----
+function findCosmetics_(query) {
+  const q = cosNorm_(query);
+  if (!q) return [];
+  const items = getCosmetics_().filter(x => x.status === 'active');
+  const exact = items.filter(x => cosNorm_(x.name) === q);
+  if (exact.length) return exact;
+  const contains = items.filter(x => cosNorm_(x.name).indexOf(q) !== -1 || q.indexOf(cosNorm_(x.name)) !== -1);
+  if (contains.length) return contains;
+  const qt = detectCosmeticType_(query).type;
+  if (qt === COSMETIC_DEFAULT_TYPE_.type) return [];
+  return items.filter(x => x.type === qt);
+}
+
+function replyPickCosmetic_(replyToken, matches, action, verb) {
+  const msg = withQuickReply_(
+    { type: 'text', text: `มี ${matches.length} ชิ้นที่ตรงกันค่ะ กดเลือกชิ้นที่จะ${verb}:\n` + matches.map(m => `• ${m.name}${m.opened ? ' (เปิด ' + cosThDate_(m.opened) + ')' : ''}`).join('\n') },
+    matches.map(m => ({ label: m.name, data: `cos:${action}:${m.id}`, display: `${verb} ${m.name}` }))
+  );
+  sendLineMessages_('reply', replyToken, [msg]);
+}
+
+function parseExpiryInput_(mm, yy) {
+  let y = Number(yy);
+  if (y < 100) y += 2000;
+  if (y > 2400) y -= 543;   // ปี พ.ศ.
+  const m = Number(mm);
+  if (!(m >= 1 && m <= 12) || y < 2000) return '';
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return y + '-' + ('0' + m).slice(-2) + '-' + ('0' + last).slice(-2);
+}
+
+// ---- การทำงานกับของ 1 ชิ้น (ใช้ร่วมกันทั้งพิมพ์และกดปุ่ม) ----
+function cosmeticAction_(action, it, extra) {
+  const today = cosToday_();
+  if (action === 'open') {
+    it.opened = today; it.flags = {}; saveCosmetic_(it);
+    return `เปิดใช้ ${it.name} แล้วค่ะ ✅\n• ใช้ได้ถึง ~${cosThDate_(cosExpiry_(it))}\n• น่าจะหมดราว ${cosThDate_(cosRunOut_(it))} (~${it.cycle} วัน)`;
+  }
+  if (action === 'unopen') {
+    it.opened = ''; it.flags = {}; saveCosmetic_(it);
+    return `โอเคค่ะ ${it.name} ยังไม่เปิดใช้ ✅\nตอนเริ่มใช้ พิมพ์ "เปิดใช้ ${it.name}" ระบบจะเริ่มนับวันหมดอายุและรอบใช้หมดให้`;
+  }
+  if (action === 'done' || action === 'trash') {
+    it.status = action === 'done' ? 'finished' : 'discarded';
+    it.finished = today;
+    if (action === 'done' && it.opened) it.actualDays = Math.max(cosDaysBetween_(it.opened, today), 1);
+    saveCosmetic_(it);
+    if (action === 'trash') return `ทิ้ง ${it.name} ออกจากคลังแล้วค่ะ 🗑️`;
+    const lines = [`บันทึกว่า ${it.name} หมดแล้วค่ะ ✅`];
+    if (it.actualDays) lines.push(`ใช้ไป ${it.actualDays} วัน (ครั้งหน้าจะคาดรอบตามนี้)`);
+    if (it.price) lines.push(`ซื้อครั้งก่อน ${fmtBaht_(it.price)} บาท เมื่อ ${cosThDate_(it.bought)}`);
+    lines.push(`ซื้อใหม่แล้วพิมพ์ เช่น "${it.name} ${it.price ? Math.round(it.price) : 390}" ได้เลยค่ะ`);
+    return lines.join('\n');
+  }
+  if (action === 'snooze') {
+    it.flags.snoozeUntil = cosAddDays_(today, COSMETIC_SNOOZE_DAYS);
+    it.flags.runout = false;
+    saveCosmetic_(it);
+    return `โอเคค่ะ จะถามเรื่อง ${it.name} ใหม่อีก ${COSMETIC_SNOOZE_DAYS} วัน 👌`;
+  }
+  if (action === 'expiry') {
+    it.printedExpiry = extra; it.flags.exp30 = false; it.flags.expired = false; saveCosmetic_(it);
+    const exp = cosExpiry_(it);
+    return `ตั้งวันหมดอายุ ${it.name} แล้วค่ะ ✅\nใช้ได้ถึง ${cosThDate_(exp)}${exp !== extra ? ' (นับจากวันเปิด ซึ่งมาก่อนวันที่พิมพ์บนกล่อง)' : ''}`;
+  }
+  return '';
+}
+
+// คืนค่า true ถ้าเป็นคำสั่งเครื่องสำอาง (จัดการแล้ว)
+function handleCosmeticsMessage_(ev, text, senderUserId, props) {
+  const t = text.trim();
+  const c = cosNorm_(t).replace(/สํา/g, 'สำ');
+  const owner = cosmeticOwnerName_(props);
+  const reply = msg => replyLine_(ev.replyToken, msg);
+
+  if (/^(คลัง|ดู)?เครื่องสำอาง(ของฉัน|ที่มี|ทั้งหมด)?$/.test(c)) { reply(buildCosmeticListText_(owner)); return true; }
+  if (/^สรุป(ค่า|ยอด)?เครื่องสำอาง/.test(c)) { reply(buildCosmeticSummaryText_(owner, props)); return true; }
+
+  let m = c.match(/^(ตั้ง)?งบ(ค่า)?เครื่องสำอาง(เดือนละ)?([\d,\.]+)(บาท)?$/);
+  if (m) {
+    const v = Number(m[4].replace(/,/g, '')) || 0;
+    if (v > 0) props.setProperty('COSMETIC_BUDGET', String(v)); else props.deleteProperty('COSMETIC_BUDGET');
+    reply(v > 0
+      ? `ตั้งงบเครื่องสำอางเดือนละ ${fmtBaht_(v)} บาทแล้วค่ะ ✅\n${cosmeticBudgetLine_(owner, localDatePrefix_(new Date(), 'yyyy-MM'), props).text}\n(ตอนบันทึกรายการ ถ้าใช้ถึง 80% จะขึ้น 🟡 เกินงบขึ้น 🔴)`
+      : 'ยกเลิกงบเครื่องสำอางแล้วค่ะ');
+    return true;
+  }
+
+  m = t.match(/^เพิ่มเครื่องส[ำํา]+อาง\s*(.*)$/);
+  if (m) {
+    let name = m[1].trim(), printed = '';
+    const em = name.match(/\s*หมดอายุ\s*(\d{1,2})\s*[\/\-.]\s*(\d{2,4})\s*$/);
+    if (em) { printed = parseExpiryInput_(em[1], em[2]); name = name.slice(0, em.index).trim(); }
+    if (!name) { reply('💄 พิมพ์ชื่อของต่อท้ายด้วยค่ะ เช่น\n"เพิ่มเครื่องสำอาง ลิป Romand"\n"เพิ่มเครื่องสำอาง กันแดด Biore หมดอายุ 05/2027"\n\n(ใช้กับของที่มีอยู่แล้ว ไม่นับเป็นรายจ่าย ถ้าเพิ่งซื้อ พิมพ์ "กันแดด Biore 390" ตามปกติได้เลย)'); return true; }
+    const r = addCosmeticItem_(name, 0, cosToday_(), true, printed);
+    const msg = withQuickReply_({ type: 'text', text:
+      `💄 เพิ่ม ${r.item.name} (${r.item.type}) เข้าคลังแล้วค่ะ ✅ (ไม่นับเป็นรายจ่าย)\n• ถือว่าเปิดใช้วันนี้ ใช้ได้ถึง ~${cosThDate_(cosExpiry_(r.item))}\n• น่าจะหมดราว ${cosThDate_(cosRunOut_(r.item))}` },
+      [{ label: 'ยังไม่ได้เปิดใช้', data: 'cos:unopen:' + r.item.id, display: 'ยังไม่ได้เปิดใช้ ' + r.item.name },
+       { label: 'ใส่วันหมดอายุ', text: r.item.name + ' หมดอายุ ' }]);
+    sendLineMessages_('reply', ev.replyToken, [msg]);
+    return true;
+  }
+
+  // คำสั่งที่อ้างถึงของ 1 ชิ้น: strict = ถ้าไม่เจอของในคลัง ให้ปล่อยไปทำงานตามปกติ (เช่น "ข้าวหมดแล้ว")
+  let action = null, query = '', extra = '', strict = true;
+  if ((m = t.match(/^เปิดใช้\s*(.+)$/))) { action = 'open'; query = m[1]; strict = false; }
+  else if ((m = t.match(/^ยังไม่(ได้)?เปิด(ใช้)?\s*(.+)$/))) { action = 'unopen'; query = m[3]; strict = false; }
+  else if ((m = t.match(/^(.+?)\s*(ใช้)?หมดแล้ว$/))) {
+    action = 'done'; query = m[1];
+    strict = detectCosmeticType_(query).type === COSMETIC_DEFAULT_TYPE_.type;   // ชื่อเหมือนเครื่องสำอาง (ลิป ครีม ฯลฯ) ไม่ปล่อยไปให้ AI
+  }
+  else if ((m = t.match(/^ทิ้ง\s*(.+)$/))) { action = 'trash'; query = m[1]; strict = false; }
+  else if ((m = t.match(/^(.+?)\s*(หมดอายุ|exp)\s*(\d{1,2})\s*[\/\-.]\s*(\d{2,4})$/i))) {
+    action = 'expiry'; query = m[1]; strict = false; extra = parseExpiryInput_(m[3], m[4]);
+    if (!extra) { reply('รูปแบบวันหมดอายุไม่ถูกค่ะ พิมพ์ เช่น "กันแดด หมดอายุ 05/2027"'); return true; }
+  }
+  if (!action) return false;
+
+  const matches = findCosmetics_(query);
+  if (!matches.length) {
+    if (strict) return false;
+    const names = getCosmetics_().filter(x => x.status === 'active').map(x => '• ' + x.name);
+    reply(`ไม่พบ "${query}" ในคลังเครื่องสำอางค่ะ (ยังไม่ได้ลบอะไร)` +
+      (names.length ? '\n\nของในคลังตอนนี้:\n' + names.slice(0, 20).join('\n') : '\n\nคลังยังว่างอยู่ค่ะ'));
+    return true;
+  }
+  if (matches.length > 1) {
+    if (action === 'expiry') {
+      const dt = t.match(/(\d{1,2}\s*[\/\-.]\s*\d{2,4})$/)[1];
+      reply('มีหลายชิ้นที่ชื่อคล้ายกันค่ะ พิมพ์ชื่อให้ชัดขึ้น เช่น:\n' + matches.map(x => `• ${x.name} หมดอายุ ${dt}`).join('\n'));
+      return true;
+    }
+    const verbs = { open: 'เปิดใช้', unopen: 'ตั้งเป็นยังไม่เปิด', done: 'บันทึกว่าหมด', trash: 'ทิ้ง' };
+    replyPickCosmetic_(ev.replyToken, matches, action, verbs[action]);
+    return true;
+  }
+  reply(cosmeticAction_(action, matches[0], extra));
+  return true;
+}
+
+function handleCosmeticPostback_(ev, data, senderUserId, props) {
+  const parts = data.split(':');           // cos:<action>:<id>
+  const action = parts[1], id = parts[2];
+  if (['open', 'unopen', 'done', 'trash', 'snooze'].indexOf(action) === -1) return;
+  const it = getCosmetics_().find(x => String(x.id) === String(id));
+  if (!it) { replyLine_(ev.replyToken, 'ไม่พบรายการนี้ในคลังแล้วค่ะ'); return; }
+  if (it.status !== 'active') {
+    replyLine_(ev.replyToken, `${it.name} ถูกบันทึกว่า${it.status === 'finished' ? 'หมดแล้ว' : 'ทิ้งแล้ว'}ไปก่อนหน้านี้ค่ะ`);
+    return;
+  }
+  replyLine_(ev.replyToken, cosmeticAction_(action, it, ''));
+}
+
+// ---- เตือนอัตโนมัติ (เรียกจาก dailyLineSummary ทุกวัน 20:00) ส่งเฉพาะอ๋อม รวมเป็นข้อความเดียว ----
+// แต่ละเรื่องเตือนครั้งเดียว: ใกล้หมดอายุ (30 วันก่อน), หมดอายุแล้ว, น่าจะใกล้หมด (7 วันก่อนครบรอบ)
+function cosmeticsDailyCheck_() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  const to = props.getProperty('PARTNER2_LINE_ID');
+  if (!token || !to) return;
+  const today = cosToday_();
+  const lines = [];
+  const quick = [];
+
+  getCosmetics_().filter(x => x.status === 'active').forEach(it => {
+    const st = cosStatusOf_(it, today);
+    let changed = false;
+    if (st.expLeft !== null && st.expLeft <= 0 && !it.flags.expired) {
+      lines.push(`⚠️ ${it.name} หมดอายุแล้ว (${cosThDate_(st.exp)}) ควรเลิกใช้ค่ะ`);
+      quick.push({ kind: 'trash', name: it.name, label: 'ทิ้งเลย', data: 'cos:trash:' + it.id, display: 'ทิ้ง ' + it.name });
+      it.flags.expired = true; it.flags.exp30 = true; changed = true;
+    } else if (st.expLeft !== null && st.expLeft > 0 && st.expLeft <= COSMETIC_EXPIRY_WARN_DAYS && !it.flags.exp30) {
+      lines.push(`⏳ ${it.name} จะหมดอายุ ${cosThDate_(st.exp)} (อีก ${st.expLeft} วัน)`);
+      it.flags.exp30 = true; changed = true;
+    }
+    const snoozed = it.flags.snoozeUntil && today < it.flags.snoozeUntil;
+    if (!it.flags.expired && st.runLeft !== null && st.runLeft <= COSMETIC_RUNOUT_WARN_DAYS && !it.flags.runout && !snoozed) {
+      const used = cosDaysBetween_(it.opened, today);
+      lines.push(`🛒 ${it.name} ใช้มา ${used} วันแล้ว น่าจะใกล้หมด` + (it.price ? ` · ครั้งก่อน ${fmtBaht_(it.price)} บาท` : ''));
+      quick.push({ kind: 'run', name: it.name, label: 'หมดแล้ว', data: 'cos:done:' + it.id, display: it.name + ' หมดแล้ว' });
+      quick.push({ kind: 'run', name: it.name, label: 'ยังเหลือ', data: 'cos:snooze:' + it.id, display: it.name + ' ยังเหลือ' });
+      it.flags.runout = true; changed = true;
+    }
+    if (changed) saveCosmetic_(it);
+  });
+
+  if (!lines.length) return;
+  // ปุ่ม LINE ยาวได้ไม่เกิน 20 ตัวอักษร: ถ้ามีของใกล้หมดชิ้นเดียว ใช้แค่ "หมดแล้ว"/"ยังเหลือ" ถ้าหลายชิ้นค่อยใส่ชื่อย่อ
+  const runCount = quick.filter(q => q.kind === 'run').length / 2;
+  if (runCount > 1) quick.filter(q => q.kind === 'run').forEach(q => { q.label = (q.label === 'หมดแล้ว' ? 'หมด: ' : 'เหลือ: ') + q.name; });
+  if (quick.filter(q => q.kind === 'trash').length > 1) quick.filter(q => q.kind === 'trash').forEach(q => { q.label = 'ทิ้ง: ' + q.name; });
+  const msg = withQuickReply_({ type: 'text', text: '💄 เตือนเครื่องสำอาง\n\n' + lines.join('\n') + '\n\nพิมพ์ "เครื่องสำอาง" เพื่อดูคลังทั้งหมด' }, quick);
+  const ok = sendLineMessages_('push', to, [msg]);
+  if (!ok) pushLine_(token, to, msg.text);
+}
+
+/** ทดสอบ: เช็คเครื่องสำอางแล้วส่งเตือนเข้า LINE อ๋อมทันที (เฉพาะรายการที่ถึงเกณฑ์และยังไม่เคยเตือน) */
+function testCosmeticsCheck() {
+  cosmeticsDailyCheck_();
+}
+
+// ---------- อ่านข้อความง่ายเอง + ปุ่มเลือกหมวด (ประหยัดเครดิต AI) ----------
+// ข้อความแบบ "ชื่อ ตัวเลข" เช่น "ข้าว 50", "ค่าน้ำ 40", "ล้างรถ 60" ระบบอ่านเองไม่ต้องเรียก AI
+// หาหมวดตามลำดับ: พิมพ์ชื่อหมวดมาตรงๆ > คำที่เคยเลือกไว้ (แท็บ Keywords) > รายการเก่าในชีต > คำพื้นฐาน
+// ถ้ายังไม่แน่ใจ → ขึ้นปุ่มให้คนที่พิมพ์กดเลือก แล้วจำคำนั้นไว้ ครั้งหน้าบันทึกเองได้
+// ข้อความที่ซับซ้อน (หารครึ่ง ย้อนวัน เงินต่างประเทศ คำสั่งแก้ไข ฯลฯ) ยังส่งให้ AI เหมือนเดิม
+
+const SHEET_KEYWORDS = 'Keywords';
+const PENDING_PREFIX_ = 'PENDING_';
+const AWAIT_CAT_PREFIX_ = 'AWAIT_CAT_';
+const AWAIT_CAT_MINUTES_ = 15;
+
+// คำที่แปลว่าข้อความนี้ซับซ้อน ต้องให้ AI อ่าน
+const COMPLEX_WORDS_ = /(^|\s)หาร|หารกัน|หารครึ่ง|ร่วมกัน|ด้วยกัน|ครึ่ง|แบ่ง|เมื่อวาน|วันก่อน|ที่แล้ว|เมื่อ\s*\d|วันที่|เดือน|(^|\s)แก้(?!ว)|(^|\s)ลบ|เปลี่ยน|สรุป|ค้นหา|ยอดที่|ย้อนหลัง|เขตเวลา|(^|\s)ตั้ง|(ไหม|มั้ย|เท่าไหร่|เท่าไร|กี่บาท)\s*\??$|\?|เยน|ดอลลาร์|ดอล|ยูโร|วอน|หยวน|ริงกิต|ปอนด์|ด่ง|กีบ|เปโซ|usd|jpy|eur|krw|cny|myr|gbp|sgd|\$|¥|€|₩|£/i;
+
+// คำพื้นฐาน → หมวด (ใช้เมื่อยังไม่เคยเรียนรู้คำนั้น) เรียงคำเจาะจงก่อน
+const BUILTIN_CATEGORY_WORDS_ = [
+  { cat: 'ค่าน้ำมัน', words: ['น้ำมัน', 'ปตท', 'ptt', 'บางจาก', 'เชลล์', 'shell', 'คาลเท็กซ์', 'caltex', 'เอสโซ่', 'esso', 'ซัสโก้', 'susco'] },
+  { cat: 'ค่าน้ำประปา', words: ['ค่าน้ำประปา', 'น้ำประปา', 'บิลน้ำ'] },
+  { cat: 'ค่าไฟ', words: ['ค่าไฟ', 'บิลไฟ', 'การไฟฟ้า'] },
+  { cat: 'เครื่องสำอาง', words: ['เครื่องสำอาง', 'ลิปสติก', 'ลิป', 'รองพื้น', 'คุชชั่น', 'มาสคาร่า', 'อายไลเนอร์', 'อายแชโดว์', 'บลัช', 'ปัดแก้ม', 'คอนซีลเลอร์', 'เซรั่ม', 'โทนเนอร์', 'กันแดด', 'มอยส์เจอไรเซอร์', 'ครีมบำรุง', 'คลีนซิ่ง', 'โฟมล้างหน้า', 'น้ำหอม', 'เขียนคิ้ว', 'มาส์กหน้า', 'แป้งพัฟ', 'แป้งฝุ่น'] },
+  { cat: 'ค่าน้ำ', words: ['ชานม', 'ชาเย็น', 'ชาไทย', 'ชาเขียว', 'ชามะนาว', 'กาแฟ', 'โกโก้', 'น้ำเปล่า', 'น้ำดื่ม', 'น้ำแข็ง', 'น้ำอัดลม', 'น้ำหวาน', 'น้ำปั่น', 'น้ำผลไม้', 'โค้ก', 'เป๊ปซี่', 'สมูทตี้', 'นมสด', 'อเมซอน', 'คาเฟ่', 'ลาเต้', 'อเมริกาโน่', 'มอคค่า', 'คาปูชิโน่'] },
+  { cat: 'ค่ากิน', words: ['ข้าว', 'กิน', 'อาหาร', 'ก๋วยเตี๋ยว', 'บะหมี่', 'เกี๊ยว', 'ส้มตำ', 'หมูกระทะ', 'ชาบู', 'สุกี้', 'ปิ้งย่าง', 'ขนม', 'โจ๊ก', 'ราดหน้า', 'ผัดไทย', 'ผัด', 'แกง', 'ต้มยำ', 'ไก่ทอด', 'หมูปิ้ง', 'ลูกชิ้น', 'ไอติม', 'ไอศกรีม', 'เค้ก', 'ขนมปัง', 'ผลไม้', 'มาม่า', 'พิซซ่า', 'เบอร์เกอร์', 'kfc', 'mk', 'สเต็ก', 'ซูชิ', 'มื้อ'] }
+];
+
+function normKey_(s) { return String(s || '').toLowerCase().replace(/\s+/g, '').replace(/สํา/g, 'สำ'); }
+
+// แยกจำนวนเงินกับชื่อรายการ คืน null ถ้าไม่ใช่รูปแบบง่าย
+function splitAmountAndItem_(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length > 60 || /\n/.test(t)) return null;
+  if (COMPLEX_WORDS_.test(t)) return null;
+  const tokens = t.split(/\s+/);
+  const isNum = tok => /^[\d,]+(\.\d+)?(บาท|บ\.?|฿)?$/.test(tok) && /\d/.test(tok);
+  const nums = tokens.filter(isNum);
+  let amountTok = null, rest = [];
+  if (nums.length === 1) {
+    amountTok = nums[0];
+    rest = tokens.filter(tok => tok !== amountTok);
+  } else if (nums.length === 0) {
+    // ติดกัน เช่น "ข้าว50" หรือ "ข้าว50บาท"
+    const m = t.match(/^(\D*?)\s*([\d,]+(?:\.\d+)?)\s*(บาท|บ\.?|฿)?\s*(\D*)$/);
+    if (!m) return null;
+    amountTok = m[2];
+    rest = [m[1], m[4]].filter(Boolean);
+  } else {
+    return null;   // หลายตัวเลข เช่น "2 แก้ว 90" ให้ AI อ่าน
+  }
+  const amount = Number(String(amountTok).replace(/บาท|บ\.?|฿/g, '').replace(/,/g, ''));
+  if (!(amount > 0) || amount > 1000000) return null;
+  const item = rest.join(' ').replace(/(^|\s)(บาท|บ\.|฿)(?=\s|$)/g, ' ').replace(/\s+/g, ' ').trim();
+  if (/\d/.test(item.replace(/\d+-\d+/g, ''))) return null;   // ยังมีตัวเลขอื่นปน (ยกเว้นชื่อแบบ 7-11)
+  return { amount: amount, item: item };
+}
+
+// ---- คำที่เรียนรู้ไว้ (แท็บ Keywords) ----
+function getKeywordSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_KEYWORDS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_KEYWORDS);
+    sh.appendRow(['Keyword', 'Category', 'Count', 'UpdatedAt']);
+  }
+  return sh;
+}
+
+function getLearnedKeywords_() {
+  return getKeywordSheet_().getDataRange().getValues().slice(1)
+    .filter(r => r[0] && r[1])
+    .map(r => ({ key: normKey_(r[0]), category: String(r[1]), count: Number(r[2]) || 1 }));
+}
+
+function learnKeyword_(item, category) {
+  const key = normKey_(item);
+  if (!key || key.length < 2 || !category || /^[\d,.]+$/.test(key)) return;
+  const sh = getKeywordSheet_();
+  const rows = sh.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    if (normKey_(rows[i][0]) === key) {
+      sh.getRange(i + 1, 2, 1, 3).setValues([[category, (Number(rows[i][2]) || 0) + 1, new Date().toISOString()]]);
+      return;
+    }
+  }
+  sh.appendRow([String(item).trim(), category, 1, new Date().toISOString()]);
+}
+
+// คืน { category, source } หรือ { category: null, hints: [...] }
+function guessCategory_(item, categories, expenses) {
+  const key = normKey_(item);
+  if (!key) return { category: null, hints: [] };
+
+  // 1) พิมพ์ชื่อหมวดมาตรงๆ (เลือกชื่อที่ยาวที่สุดที่ตรง เช่น "ค่าน้ำมัน" ชนะ "ค่าน้ำ")
+  const explicit = categories.filter(c => key.indexOf(normKey_(c)) === 0)
+    .sort((a, b) => normKey_(b).length - normKey_(a).length)[0];
+  if (explicit) return { category: explicit, source: 'explicit', note: item.replace(new RegExp('^\\s*' + explicit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*'), '').trim() };
+
+  // 2) คำที่เคยกดเลือกไว้: ตรงเป๊ะก่อน แล้วค่อยหาคำที่ยาวที่สุดที่อยู่ในข้อความ
+  const learned = getLearnedKeywords_();
+  const exact = learned.find(k => k.key === key);
+  if (exact) return { category: exact.category, source: 'learned' };
+  const partial = learned.filter(k => k.key.length >= 3 && key.indexOf(k.key) !== -1)
+    .sort((a, b) => b.key.length - a.key.length);
+  if (partial.length && partial.filter(p => p.key.length === partial[0].key.length && p.category !== partial[0].category).length === 0) {
+    return { category: partial[0].category, source: 'learned' };
+  }
+
+  // 3) รายการเก่าในชีตที่หมายเหตุตรงกับข้อความนี้ (ต้องเป็นหมวดเดียวกันอย่างน้อย 70%)
+  const counts = {};
+  expenses.forEach(e => {
+    const n = normKey_(e.note);
+    if (!n || n.indexOf('≈') !== -1 || n.length > 40) return;
+    if (n === key || (n.length >= 3 && key.indexOf(n) !== -1) || (key.length >= 5 && n.indexOf(key) !== -1)) counts[e.category] = (counts[e.category] || 0) + 1;
+  });
+  const total = Object.keys(counts).reduce((s, c) => s + counts[c], 0);
+  const top = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+  if (top && counts[top] / total >= 0.7) return { category: top, source: 'history' };
+
+  // 4) คำพื้นฐาน (ต้องตรงหมวดเดียวเท่านั้น ถ้าตรงหลายหมวดให้ถาม)
+  const hits = [];
+  BUILTIN_CATEGORY_WORDS_.forEach(g => {
+    if (g.words.some(w => key.indexOf(normKey_(w)) !== -1)) hits.push(g.cat);
+  });
+  const usable = hits.filter(c => categories.indexOf(c) !== -1 || c === 'ค่าน้ำมัน' || c === COSMETIC_CATEGORY);
+  if (usable.length === 1) return { category: usable[0], source: 'builtin' };
+  return { category: null, hints: usable.length ? usable : (top ? [top] : []) };
+}
+
+// ---- ลองบันทึกเองโดยไม่ใช้ AI: คืน true ถ้าจัดการแล้ว (บันทึกหรือขึ้นปุ่ม) ----
+function tryLocalExpense_(ev, text, senderUserId, props) {
+  const sp = splitAmountAndItem_(text);
+  if (!sp) return false;
+  const data = getAllData_();
+  const g = guessCategory_(sp.item, data.categories, data.expenses);
+
+  if (g.category) {
+    let note = g.source === 'explicit' ? g.note : sp.item;
+    if (normKey_(note) === normKey_(g.category)) note = '';
+    if (g.source === 'explicit' && note) learnKeyword_(note, g.category);   // "ค่ากิน 60 ร้านถุงเงิน" → จำว่าร้านถุงเงิน = ค่ากิน
+    countAiUsage_('local');
+    logParsedResult_({
+      type: 'expense', amount: sp.amount, category: g.category, shared: false, splitHalf: false,
+      daysAgo: 0, currency: 'THB', note: note, itemName: g.category === COSMETIC_CATEGORY ? (note || sp.item) : ''
+    }, senderUserId, props, ev.replyToken, { suffix: pendingSuffix_(senderUserId) });
+    return true;
+  }
+
+  // ไม่แน่ใจหมวด → เก็บไว้รอเลือก แล้วขึ้นปุ่ม
+  const p = createPending_(senderUserId, sp.amount, sp.item);
+  sendLineMessages_('reply', ev.replyToken, [buildPendingMessage_(p, data, g.hints, '')]);
+  return true;
+}
+
+// ---- รายการรอเลือกหมวด ----
+function createPending_(userId, amount, item) {
+  // กันรายการซ้ำ: ยอดเท่ากันและชื่อเหมือน/คล้ายกัน (ชื่อหนึ่งอยู่ในอีกชื่อ) ใช้รายการเดิม
+  const k = normKey_(item);
+  const dup = getPendings_(userId).find(x => Math.abs(x.amount - amount) < 0.001 &&
+    (normKey_(x.item) === k || (k && normKey_(x.item) && (normKey_(x.item).indexOf(k) !== -1 || k.indexOf(normKey_(x.item)) !== -1))));
+  if (dup) return dup;
+  const id = String(Date.now()) + Math.floor(Math.random() * 1000);
+  const p = { id: id, userId: userId, amount: amount, item: item, localDate: localDatePrefix_(new Date(), 'yyyy-MM-dd'), at: new Date().toISOString() };
+  PropertiesService.getScriptProperties().setProperty(PENDING_PREFIX_ + id, JSON.stringify(p));
+  return p;
+}
+
+function getPendings_(userId) {
+  const all = PropertiesService.getScriptProperties().getProperties();
+  return Object.keys(all).filter(k => k.indexOf(PENDING_PREFIX_) === 0)
+    .map(k => { try { return JSON.parse(all[k]); } catch (e) { return null; } })
+    .filter(p => p && (!userId || p.userId === userId))
+    .sort((a, b) => a.at.localeCompare(b.at));
+}
+
+function getPending_(id) {
+  const raw = PropertiesService.getScriptProperties().getProperty(PENDING_PREFIX_ + id);
+  try { return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+}
+
+function deletePending_(id) { PropertiesService.getScriptProperties().deleteProperty(PENDING_PREFIX_ + id); }
+
+function pendingSuffix_(userId) {
+  const n = getPendings_(userId).length;
+  return n ? `\n\n⏳ ยังรอเลือกหมวดอีก ${n} รายการ พิมพ์ "รอเลือกหมวด"` : '';
+}
+
+// หมวดที่คนนี้ใช้บ่อยใน 90 วัน มาก่อน
+function categoriesForButtons_(userId, data, hints) {
+  const props = PropertiesService.getScriptProperties();
+  const who = resolveWho_(userId, props);
+  const since = localDatePrefix_(new Date(Date.now() - 90 * 86400000), 'yyyy-MM-dd');
+  const freq = {};
+  data.expenses.forEach(e => { if (e.who === who && (e.localDate || '') >= since) freq[e.category] = (freq[e.category] || 0) + 1; });
+  const order = data.categories.slice().sort((a, b) => (freq[b] || 0) - (freq[a] || 0));
+  const list = [];
+  (hints || []).concat(order).forEach(c => { if (c && list.indexOf(c) === -1) list.push(c); });
+  return list.slice(0, 11);
+}
+
+function buildPendingMessage_(p, data, hints, prefix, totalPending) {
+  const many = (totalPending || getPendings_(p.userId).length) > 1;
+  const cats = categoriesForButtons_(p.userId, data || getAllData_(), hints).slice(0, many ? 10 : 11);
+  const label = p.item ? `${fmtBaht_(p.amount)} บาท · ${p.item}` : `${fmtBaht_(p.amount)} บาท`;
+  const items = cats.map(c => ({ label: c, data: 'cat:' + p.id + ':' + c, display: c }));
+  items.push({ label: '➕ หมวดใหม่', data: 'catnew:' + p.id, display: 'หมวดใหม่' });
+  items.push({ label: 'ยกเลิก', data: 'catx:' + p.id, display: 'ยกเลิก' });
+  if (many) items.push({ label: '🗑 ล้างทั้งหมด', data: 'catclear:' + p.id, display: 'ล้างรายการรอเลือกหมวดทั้งหมด' });
+  const dayNote = p.localDate !== localDatePrefix_(new Date(), 'yyyy-MM-dd') ? ` (ของวันที่ ${cosThDate_(p.localDate)})` : '';
+  return withQuickReply_({ type: 'text', text: (prefix || '') + `🗂️ ${label}${dayNote}\nเลือกหมวดค่ะ (เลือกครั้งเดียว ครั้งหน้าน้องออมจำให้เอง)` }, items);
+}
+
+// บันทึกรายการที่รอ เมื่อได้หมวดแล้ว
+function savePendingWithCategory_(p, category, replyToken) {
+  const props = PropertiesService.getScriptProperties();
+  deletePending_(p.id);
+  props.deleteProperty(AWAIT_CAT_PREFIX_ + p.userId);
+  if (p.item) learnKeyword_(p.item, category);
+  countAiUsage_('button');
+  logParsedResult_({
+    type: 'expense', amount: p.amount, category: category, shared: false, splitHalf: false,
+    currency: 'THB', note: p.item || '', itemName: category === COSMETIC_CATEGORY ? (p.item || '') : '',
+    transactionDate: p.localDate
+  }, p.userId, props, replyToken, { suffix: (p.item ? `\n(จำแล้วค่ะ ครั้งหน้า "${p.item}" จะเข้าหมวด ${category} ให้เอง)` : '') + pendingSuffix_(p.userId) });
+}
+
+function clearPendings_(userId) {
+  const list = getPendings_(userId);
+  list.forEach(p => deletePending_(p.id));
+  PropertiesService.getScriptProperties().deleteProperty(AWAIT_CAT_PREFIX_ + userId);
+  return list;
+}
+
+function clearPendingsText_(list) {
+  if (!list.length) return 'ไม่มีรายการรอเลือกหมวดค่ะ 👍';
+  return `ล้างรายการรอเลือกหมวด ${list.length} รายการแล้วค่ะ (ไม่ได้บันทึก)\n` +
+    list.slice(0, 15).map(p => `• ${fmtBaht_(p.amount)} บาท${p.item ? ' · ' + p.item : ''}`).join('\n') +
+    '\n\nถ้ามีรายการไหนที่ต้องบันทึก พิมพ์ใหม่ได้เลยค่ะ';
+}
+
+function handleCategoryPostback_(ev, data, senderUserId, props) {
+  const parts = data.split(':');
+  const kind = parts[0], id = parts[1];
+  if (kind === 'catclear') { replyLine_(ev.replyToken, clearPendingsText_(clearPendings_(senderUserId))); return; }
+  const p = getPending_(id);
+  if (!p) { replyLine_(ev.replyToken, 'รายการนี้บันทึกหรือยกเลิกไปแล้วค่ะ'); return; }
+  if (p.userId !== senderUserId) {
+    replyLine_(ev.replyToken, `ปุ่มนี้สำหรับ${resolveWho_(p.userId, props)}ค่ะ (คนที่พิมพ์รายการนี้เป็นคนเลือกหมวด)`);
+    return;
+  }
+  if (kind === 'catx') {
+    deletePending_(id);
+    props.deleteProperty(AWAIT_CAT_PREFIX_ + senderUserId);
+    replyLine_(ev.replyToken, `ยกเลิกแล้วค่ะ ไม่ได้บันทึก ${fmtBaht_(p.amount)} บาท${p.item ? ' · ' + p.item : ''}` + pendingSuffix_(senderUserId));
+    return;
+  }
+  if (kind === 'catnew') {
+    props.setProperty(AWAIT_CAT_PREFIX_ + senderUserId, JSON.stringify({ id: id, at: Date.now() }));
+    replyLine_(ev.replyToken, `พิมพ์แค่ชื่อหมวดใหม่ (ไม่ต้องใส่ราคา) สำหรับ ${fmtBaht_(p.amount)} บาท${p.item ? ' · ' + p.item : ''} ได้เลยค่ะ\nเช่น "ค่าโทรศัพท์" หรือ "ค่าเดินทาง" (พิมพ์ "ยกเลิก" ถ้าไม่บันทึกแล้ว)`);
+    return;
+  }
+  const category = parts.slice(2).join(':');
+  if (!category) return;
+  savePendingWithCategory_(p, category, ev.replyToken);
+}
+
+// กำลังรอให้พิมพ์ชื่อหมวดใหม่อยู่ไหม: คืน true ถ้าข้อความนี้ถูกใช้เป็นชื่อหมวดแล้ว
+const RESERVED_TEXTS_ = ['ล้างรอเลือกหมวด', 'สรุป', 'สรุปวันนี้', 'สรุปเดือนนี้', 'วิธีใช้', 'ลบ', 'ลบรายการ', 'รอเลือกหมวด', 'เครดิตai', 'เครื่องสำอาง', 'ยอดยืม', 'สำรองข้อมูล', 'บันทึกรายจ่าย'];
+function handleAwaitCategory_(ev, text, senderUserId, props) {
+  const raw = props.getProperty(AWAIT_CAT_PREFIX_ + senderUserId);
+  if (!raw) return false;
+  let w = null;
+  try { w = JSON.parse(raw); } catch (e) {}
+  if (!w || Date.now() - w.at > AWAIT_CAT_MINUTES_ * 60000) { props.deleteProperty(AWAIT_CAT_PREFIX_ + senderUserId); return false; }
+  const p = getPending_(w.id);
+  if (!p) { props.deleteProperty(AWAIT_CAT_PREFIX_ + senderUserId); return false; }
+  const t = text.trim();
+  if (t === 'ยกเลิก') {
+    deletePending_(p.id); props.deleteProperty(AWAIT_CAT_PREFIX_ + senderUserId);
+    replyLine_(ev.replyToken, `ยกเลิกแล้วค่ะ ไม่ได้บันทึก ${fmtBaht_(p.amount)} บาท` + pendingSuffix_(senderUserId));
+    return true;
+  }
+  if (/\d/.test(t)) {
+    const sp = splitAmountAndItem_(t);
+    if (sp && Math.abs(sp.amount - p.amount) < 0.001) {
+      // พิมพ์ราคาเดิมซ้ำ = ยังเป็นรายการเดิม ถามหมวดอีกครั้ง ไม่สร้างรายการใหม่
+      props.setProperty(AWAIT_CAT_PREFIX_ + senderUserId, JSON.stringify({ id: p.id, at: Date.now() }));
+      sendLineMessages_('reply', ev.replyToken, [buildPendingMessage_(p, null, [],
+        'ตอนนี้รอชื่อหมวดของรายการนี้อยู่ค่ะ ไม่ต้องพิมพ์ราคาซ้ำ\nกดเลือกหมวดด้านล่าง หรือพิมพ์แค่ชื่อหมวดใหม่ เช่น "ค่าโทรศัพท์"\n\n')]);
+      return true;
+    }
+    props.deleteProperty(AWAIT_CAT_PREFIX_ + senderUserId);   // ยอดไม่ตรง = รายจ่ายใหม่ เลิกรอ (รายการเดิมยังค้างให้เลือกทีหลัง)
+    return false;
+  }
+  if (t.length > 25 || RESERVED_TEXTS_.indexOf(normKey_(t)) !== -1) {
+    props.deleteProperty(AWAIT_CAT_PREFIX_ + senderUserId);   // พิมพ์เรื่องอื่นแล้ว เลิกรอ (รายการยังค้างให้เลือกทีหลัง)
+    return false;
+  }
+  savePendingWithCategory_(p, t, ev.replyToken);
+  return true;
+}
+
+function showNextPending_(replyToken, userId) {
+  const list = getPendings_(userId);
+  if (!list.length) { replyLine_(replyToken, 'ไม่มีรายการรอเลือกหมวดค่ะ 👍'); return; }
+  const prefix = list.length > 1 ? `รอเลือกหมวด ${list.length} รายการ เริ่มจากรายการแรกค่ะ\n\n` : '';
+  sendLineMessages_('reply', replyToken, [buildPendingMessage_(list[0], null, [], prefix, list.length)]);
+}
+
+// สำหรับสรุป 20:00: บอกรายการที่ยังไม่ได้เลือกหมวด
+function pendingSummaryLines_() {
+  const props = PropertiesService.getScriptProperties();
+  const list = getPendings_(null);
+  if (!list.length) return [];
+  const lines = ['', '⏳ รอเลือกหมวด (ยังไม่ได้บันทึก):'];
+  list.slice(0, 10).forEach(p => lines.push(`• ${fmtBaht_(p.amount)} บาท${p.item ? ' · ' + p.item : ''} (${resolveWho_(p.userId, props)})`));
+  lines.push('พิมพ์ "รอเลือกหมวด" เพื่อเลือกต่อค่ะ');
+  return lines;
+}
+
+// ---------- นับการใช้ AI + จัดการเมื่อ AI ใช้ไม่ได้ ----------
+let LAST_AI_ERROR_ = null;   // { code, text } ของการเรียก AI ครั้งล่าสุดที่ล้มเหลว (เฉพาะรอบการทำงานนี้)
+
+function countAiUsage_(kind) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const key = 'AI_USAGE_' + localDatePrefix_(new Date(), 'yyyy-MM');
+    let u = {};
+    try { u = JSON.parse(props.getProperty(key) || '{}'); } catch (e) { u = {}; }
+    u[kind] = (u[kind] || 0) + 1;
+    props.setProperty(key, JSON.stringify(u));
+  } catch (e) { Logger.log('countAiUsage_ error: ' + e); }
+}
+
+function aiErrorKind_(err) {
+  if (!err) return null;
+  const t = String(err.text || '');
+  if (/credit balance|billing|purchase credits/i.test(t)) return 'credit';
+  if (err.code === 401 || err.code === 403 || /invalid x-api-key|authentication/i.test(t)) return 'key';
+  if (err.code === 429) return 'rate';
+  if (err.code === 529 || err.code >= 500) return 'busy';
+  return 'other';
+}
+
+function aiErrorUserText_(kind) {
+  if (kind === 'credit') return '⚠️ ตอนนี้เครดิต AI หมด น้องออมเลยอ่านข้อความนี้ไม่ได้ค่ะ ยังไม่ได้บันทึก';
+  if (kind === 'key') return '⚠️ ระบบ AI ใช้ไม่ได้ (API key มีปัญหา) น้องออมเลยอ่านข้อความนี้ไม่ได้ค่ะ ยังไม่ได้บันทึก';
+  if (kind === 'rate' || kind === 'busy') return '⚠️ ระบบ AI ไม่ว่างชั่วคราว ลองส่งใหม่อีกครั้งในอีกสักครู่นะคะ ยังไม่ได้บันทึก';
+  return '⚠️ ระบบ AI มีปัญหาชั่วคราว ยังไม่ได้บันทึกค่ะ';
+}
+
+// แจ้งโฟกัสวันละครั้งเมื่อเครดิตหมด/คีย์มีปัญหา
+function notifyAdminAiProblem_(kind) {
+  if (kind !== 'credit' && kind !== 'key') return;
+  const props = PropertiesService.getScriptProperties();
+  const today = localDatePrefix_(new Date(), 'yyyy-MM-dd');
+  if (props.getProperty('AI_ALERT_DATE') === today) return;
+  props.setProperty('AI_ALERT_DATE', today);
+  const token = props.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  const adminId = props.getProperty('ADMIN_LINE_ID') || props.getProperty('PARTNER1_LINE_ID');
+  if (!token || !adminId) return;
+  pushLine_(token, adminId, kind === 'credit'
+    ? '⚠️ เครดิต Claude API หมดแล้ว\nข้อความที่ซับซ้อนและการอ่านสลิปจะใช้ไม่ได้จนกว่าจะเติมเครดิต\n(ข้อความแบบ "ชื่อ ตัวเลข" ยังบันทึกได้ตามปกติ)\nเติมได้ที่ console.anthropic.com → Billing'
+    : '⚠️ Claude API key ใช้ไม่ได้ (401/403)\nเช็ค CLAUDE_API_KEY ใน Script Properties');
+}
+
+function aiUsageText_() {
+  const props = PropertiesService.getScriptProperties();
+  const mk = localDatePrefix_(new Date(), 'yyyy-MM');
+  let u = {};
+  try { u = JSON.parse(props.getProperty('AI_USAGE_' + mk) || '{}'); } catch (e) {}
+  const ai = (u.text || 0) + (u.image || 0);
+  const free = (u.local || 0) + (u.button || 0);
+  const pct = ai + free ? Math.round(free / (ai + free) * 100) : 0;
+  const learned = getLearnedKeywords_().length;
+  return `🤖 การใช้ AI เดือน${monthLabelTh_(mk)}\n` +
+    `• อ่านข้อความด้วย AI: ${u.text || 0} ครั้ง\n` +
+    `• อ่านสลิปด้วย AI: ${u.image || 0} ครั้ง\n` +
+    `• ระบบอ่านเอง: ${u.local || 0} ครั้ง · กดปุ่มเลือกหมวด: ${u.button || 0} ครั้ง\n` +
+    `→ ไม่ใช้เครดิต ${pct}% ของรายการ\n` +
+    `• คำที่จำหมวดไว้แล้ว: ${learned} คำ (แท็บ Keywords)`;
+}
+
+// ---------- บันทึกจากหน้าแอป (เฉพาะผู้ดูแลที่มี ADMIN_KEY) ----------
+// who = ชื่อคน หรือ 'half' (หารครึ่ง แยกเป็น 2 รายการ) · localDate = YYYY-MM-DD (ย้อนหลังได้)
+
+function appSaveExpense_(who, category, amount, note, localDate) {
+  const props = PropertiesService.getScriptProperties();
+  const [name1, name2] = [props.getProperty('PARTNER1') || 'คนที่ 1', props.getProperty('PARTNER2') || 'คนที่ 2'];
+  amount = Number(amount);
+  if (!category || !(amount > 0)) return { error: 'กรอกหมวดและจำนวนเงินให้ถูกต้อง' };
+  const today = localDatePrefix_(new Date(), 'yyyy-MM-dd');
+  const ld = /^\d{4}-\d{2}-\d{2}$/.test(localDate || '') ? localDate : today;
+  if (ld > today) return { error: 'เลือกวันที่ในอนาคตไม่ได้' };
+  const iso = ld === today ? new Date().toISOString() : new Date(ld + 'T12:00:00').toISOString();
+  const recordedAt = new Date().toISOString();
+  note = String(note || '').trim();
+
+  if (who === 'half') {
+    const half = Math.round((amount / 2) * 100) / 100;
+    addExpense_(name1, category, half, note, iso, ld, recordedAt);
+    addExpense_(name2, category, half, note, iso, ld, recordedAt);
+  } else {
+    const w = (who === name1 || who === name2 || who === WHO_SHARED) ? who : name1;
+    addExpense_(w, category, amount, note, iso, ld, recordedAt);
+    // เครื่องสำอางของอ๋อม: เข้าคลังด้วย
+    if (category === COSMETIC_CATEGORY && w === cosmeticOwnerName_(props)) {
+      try { addCosmeticItem_(note || COSMETIC_CATEGORY, amount, ld, true, ''); } catch (e) { Logger.log('app cosmetic add: ' + e); }
+    }
+  }
+  addCategory_(category);
+  if (note && note.length <= 30) learnKeyword_(note, category);   // ครั้งหน้าพิมพ์ใน LINE จะเข้าหมวดนี้เอง
+  return null;
+}
+
+function addExpenseFromApp_(p) {
+  const err = appSaveExpense_(p.who, p.category, p.amount, p.note, p.localDate);
+  return err ? Object.assign(getAllData_(), err) : null;
+}
+
+function resolvePendingFromApp_(p) {
+  const pend = getPending_(p.id);
+  if (!pend) return Object.assign(getAllData_(), { error: 'รายการนี้บันทึกหรือยกเลิกไปแล้ว' });
+  const props = PropertiesService.getScriptProperties();
+  const who = p.who || resolveWho_(pend.userId, props);
+  const err = appSaveExpense_(who, p.category, pend.amount, pend.item, p.localDate || pend.localDate);
+  if (err) return Object.assign(getAllData_(), err);
+  deletePending_(pend.id);
+  props.deleteProperty(AWAIT_CAT_PREFIX_ + pend.userId);
+  countAiUsage_('button');
+  return null;
+}
+
 // ---------- ตัวช่วยติดตั้ง ----------
 
 function testSend() {
@@ -1448,11 +2843,6 @@ function testParseMessage() {
   Logger.log(JSON.stringify(result));
 }
 
-/**
- * รันครั้งเดียวจาก Editor เพื่อ "รีเซ็ต" ล้างรายการรายจ่ายเก่าทั้งหมดออก
- * แล้วใส่รายการเริ่มต้นของวันนี้ให้ใหม่: โฟกัส ค่ากิน 70, อ๋อม ค่ากิน 125
- * (แก้ตัวเลข/ชื่อหมวดในฟังก์ชันนี้เองได้ถ้าอยากเปลี่ยนค่าเริ่มต้น)
- */
 /**
  * รันครั้งเดียวจาก Editor หลังอัปเดตโค้ดเป็นเวอร์ชันที่มีคอลัมน์ "LocalDate"
  * เพื่อเติมวันที่ท้องถิ่นให้กับรายการเก่าที่บันทึกไว้ก่อนหน้านี้ (สมมติว่าบันทึกด้วยเขตเวลาไทย)
@@ -1486,6 +2876,11 @@ function backfillLocalDates() {
   Logger.log('เติม/แก้ LocalDate ให้รายการเก่าเรียบร้อย: ' + updated + ' แถว');
 }
 
+/**
+ * รันครั้งเดียวจาก Editor เพื่อ "รีเซ็ต" ล้างรายการรายจ่ายเก่าทั้งหมดออก
+ * แล้วใส่รายการเริ่มต้นของวันนี้ให้ใหม่: โฟกัส ค่ากิน 70, อ๋อม ค่ากิน 125
+ * (แก้ตัวเลข/ชื่อหมวดในฟังก์ชันนี้เองได้ถ้าอยากเปลี่ยนค่าเริ่มต้น)
+ */
 function resetExpensesWithSeed() {
   const { expenses } = ensureSheets_();
   const lastRow = expenses.getLastRow();
@@ -1656,6 +3051,8 @@ function setupDashboard() {
   sheet.setColumnWidth(3, 230);
   sheet.setColumnWidths(4, 2, 130);
   sheet.setFrozenRows(4);
+
+  writeBackupStatusToDashboard_();
 
   Logger.log('สร้างแท็บ Dashboard เรียบร้อย — เปิด Google Sheet แล้วไปที่แท็บ Dashboard ได้เลย');
 }
