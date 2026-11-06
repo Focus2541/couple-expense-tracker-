@@ -399,7 +399,8 @@ function whoOptions(selected){
 function renderPendings(){
   const list = data.pendings || [];
   if(!list.length) return '';
-  const catOpts = '<option value="">เลือกหมวด…</option>' + data.categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  const catOpts = '<option value="">เลือกหมวด…</option>' + data.categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('') +
+    '<option value="__new__">➕ หมวดใหม่…</option>';
   return `
     <div class="pending-wrap">
       <h3>⏳ รอเลือกหมวด (${list.length})</h3>
@@ -423,9 +424,22 @@ function renderPendings(){
 function wirePendings(){
   document.querySelectorAll('.pending-card').forEach(card => {
     const id = card.dataset.id;
+    const sel = card.querySelector('.p-cat');
+    sel.onchange = () => {
+      if(sel.value !== '__new__') return;
+      const name = (prompt('ตั้งชื่อหมวดใหม่ (เช่น ค่าดูดวง, อื่นๆ)') || '').trim();
+      if(!name){ sel.value = ''; return; }
+      let opt = Array.from(sel.options).find(o => o.value === name);
+      if(!opt){
+        opt = document.createElement('option');
+        opt.value = name; opt.textContent = name;
+        sel.insertBefore(opt, sel.querySelector('option[value="__new__"]'));
+      }
+      sel.value = name;
+    };
     card.querySelector('.p-save').onclick = async (ev) => {
       const category = card.querySelector('.p-cat').value;
-      if(!category){ alert('เลือกหมวดก่อนนะ'); return; }
+      if(!category || category === '__new__'){ alert('เลือกหมวดก่อนนะ'); return; }
       ev.target.disabled = true; ev.target.textContent = 'กำลังบันทึก...';
       const ok = await apiSave('resolvePending', { id, category, who: card.querySelector('.p-who').value, localDate: card.querySelector('.p-date').value });
       render();
